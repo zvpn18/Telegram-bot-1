@@ -15,7 +15,7 @@ import asyncio
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7817602011:AAHioblDdeZNdhUCuNRSqTKjK5PO-LotivI")
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002093792613"))
 AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "prodottipe0c9-21")
-ADMIN_USER_ID = 6930429334  # tuo ID Telegram
+ADMIN_USER_ID = 6930429334
 DB_FILE = "bot_data.db"
 
 logging.basicConfig(level=logging.INFO)
@@ -23,8 +23,6 @@ logging.basicConfig(level=logging.INFO)
 # --- DATABASE ---
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
-
-# Tabelle licenze e utenti attivi
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS licenses (
     key TEXT PRIMARY KEY,
@@ -41,7 +39,7 @@ CREATE TABLE IF NOT EXISTS active_users (
 """)
 conn.commit()
 
-# --- Funzioni licenze ---
+# --- FUNZIONI LICENZE ---
 def create_license(days_valid=30, admin=False):
     key = str(uuid.uuid4()).split("-")[0].upper()
     expiry = "9999-12-29T23:59:59" if admin else (datetime.datetime.now() + datetime.timedelta(days=days_valid)).isoformat()
@@ -71,7 +69,7 @@ def activate_license(user_id, user_key):
     conn.commit()
     return True, is_admin
 
-# --- Genera chiave admin se non esiste ---
+# --- CREA CHIAVE ADMIN SE NON ESISTE ---
 cursor.execute("SELECT key FROM licenses WHERE admin=1")
 admin_row = cursor.fetchone()
 if admin_row:
@@ -80,12 +78,12 @@ else:
     admin_key, _ = create_license(admin=True)
     print(f"Chiave Admin generata: {admin_key} (scade 29/12/9999)")
 
-# --- Funzioni Amazon ---
+# --- FUNZIONI AMAZON ---
 async def expand_url(url):
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.head(url, follow_redirects=True)
-            return resp.url
+            return str(resp.url)
         except:
             return url
 
@@ -113,7 +111,7 @@ def add_affiliate_tag(url, tag):
         return url
     return f"https://www.amazon.it/dp/{asin}?tag={tag}"
 
-# --- Check licenza ---
+# --- CHECK LICENZA ---
 async def check_user_license(update: Update):
     user_id = update.message.from_user.id
     if user_id == ADMIN_USER_ID:
@@ -126,7 +124,25 @@ async def check_user_license(update: Update):
         return False
     return True
 
-# --- Gestione link Amazon ---
+# --- /LICENZE ---
+async def licenze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Non hai i permessi per gestire le licenze.")
+        return
+    cursor.execute("SELECT key, expiry, used, admin FROM licenses")
+    rows = cursor.fetchall()
+    if not rows:
+        await update.message.reply_text("Nessuna licenza trovata.")
+        return
+    msg = "🔑 Licenze attuali:\n\n"
+    for key, expiry, used, admin_flag in rows:
+        status = "Usata" if used else "Disponibile"
+        admin_str = " (Admin)" if admin_flag else ""
+        msg += f"{key} - Scadenza: {expiry} - {status}{admin_str}\n"
+    await update.message.reply_text(msg)
+
+# --- GESTIONE LINK AMAZON ---
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_user_license(update):
         return
@@ -142,15 +158,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Per favore manda un link Amazon valido 🔗")
         return
 
+    # Manda subito il messaggio di caricamento
     loading_msg = await update.message.reply_text("📦 Caricamento prodotto...")
-    asyncio.create_task(parse_and_update(context.bot, loading_msg.chat_id, loading_msg.message_id, url, context))
+    # Parsing asincrono
+    await parse_and_update(context.bot, loading_msg.chat_id, loading_msg.message_id, url, context)
 
 async def parse_and_update(bot, chat_id, msg_id, url, context):
     context.user_data["product_ready"] = False
     url = await expand_url(url)
     url = add_affiliate_tag(url, AFFILIATE_TAG)
     title, img_url, final_url = await parse_amazon(url)
-
     context.user_data["product"] = {"title": title, "img": img_url, "url": final_url, "price": "Prezzo non inserito"}
     context.user_data["product_ready"] = True
 
@@ -171,7 +188,7 @@ async def parse_and_update(bot, chat_id, msg_id, url, context):
     except Exception as e:
         logging.error(e)
 
-# --- Callback bottoni e gestione prezzo/titolo ---
+# --- CALLBACK BOTTONI ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -216,37 +233,3 @@ async def manual_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["product"]["title"] = new_title
         await update.message.reply_text(f"Titolo aggiornato a: {new_title}")
         context.user_data["waiting_title"] = False
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id == ADMIN_USER_ID:
-        activate_license(user_id, admin_key)
-        await update.message.reply_text("Accesso Admin attivato automaticamente ✅")
-        return
-    if not await check_user_license(update):
-        return
-    await update.message.reply_text("Benvenuto! Inviami un link Amazon.")
-
-# --- Flask keep-alive ---
-flask_app = Flask('')
-
-@flask_app.route('/')
-def home():
-    return "Bot attivo 🚀"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
-
-Thread(target=run_flask).start()
-
-# --- Avvio bot ---
-def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
