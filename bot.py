@@ -214,4 +214,22 @@ def telegram_webhook():
     update = Update.de_json(request.get_json(force=True), bot_app.bot)
     asyncio.get_event_loop().create_task(bot_app.update_queue.put(update))
     return "OK"
-def run_flask(): app.run(host="0.0
+def run_flask(): app.run(host="0.0.0.0", port=PORT)
+
+# --- AVVIO BOT ---
+bot_app = ApplicationBuilder().token(TOKEN).build()
+bot_app.add_handler(CommandHandler("start", start))
+bot_app.add_handler(CommandHandler("licenze", licenze_command))
+bot_app.add_handler(CommandHandler("crealicenza", crea_licenza_command))
+bot_app.add_handler(CommandHandler("rimuovilicense", rimuovi_licenza_command))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button_text))
+
+# Avvia Flask in thread separato
+Thread(target=run_flask).start()
+
+# Imposta webhook Telegram
+bot_app.run_webhook(
+    listen="0.0.0.0",
+    port=PORT,
+    webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
+)
