@@ -1,7 +1,19 @@
-import logging, os, sqlite3, uuid, datetime, asyncio, httpx
+import logging
+import os
+import sqlite3
+import uuid
+import datetime
+import asyncio
+import httpx
 from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto,
+    ReplyKeyboardMarkup
+)
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
+)
 
 # --- CONFIG ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -20,13 +32,15 @@ CREATE TABLE IF NOT EXISTS licenses (
     expiry TEXT,
     used INTEGER DEFAULT 0,
     admin INTEGER DEFAULT 0
-)""")
+)
+""")
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS active_users (
     user_id INTEGER PRIMARY KEY,
     license_key TEXT,
     affiliate_tag TEXT
-)""")
+)
+""")
 conn.commit()
 
 # --- CREA ADMIN SE NON ESISTE ---
@@ -36,8 +50,10 @@ if row:
     ADMIN_KEY = row[0]
 else:
     ADMIN_KEY = str(uuid.uuid4()).split("-")[0].upper()
-    cursor.execute("INSERT INTO licenses (key, expiry, used, admin) VALUES (?, ?, 0, 1)",
-                   (ADMIN_KEY, "9999-12-29T23:59:59"))
+    cursor.execute(
+        "INSERT INTO licenses (key, expiry, used, admin) VALUES (?, ?, 0, 1)",
+        (ADMIN_KEY, "9999-12-29T23:59:59")
+    )
     conn.commit()
     print(f"Chiave Admin: {ADMIN_KEY}")
 
@@ -66,6 +82,10 @@ def renew_license(key, months):
 def delete_license(key):
     cursor.execute("DELETE FROM licenses WHERE key=?", (key,))
     conn.commit()
+
+def list_licenses():
+    cursor.execute("SELECT key, expiry, used, admin FROM licenses")
+    return cursor.fetchall()
 
 async def check_user_license(update: Update):
     user_id = update.message.from_user.id
@@ -134,18 +154,7 @@ async def set_affiliate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     await update.message.reply_text(f"✅ Il tuo ID affiliato è stato impostato su: {tag}")
 
-# --- MENU ADMIN LICENZE ---
-async def menu_admin_licenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Crea Licenza", callback_data="create_license")],
-        [InlineKeyboardButton("Rinnova Licenza", callback_data="renew_license")],
-        [InlineKeyboardButton("Elimina Licenza", callback_data="delete_license")],
-        [InlineKeyboardButton("Lista Licenze", callback_data="list_license")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("🔑 Menu Gestione Licenze:", reply_markup=reply_markup)
-
-# --- GESTIONE LINK AMAZON ---
+# --- HANDLER LINK AMAZON ---
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_user_license(update):
         return
@@ -197,26 +206,133 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                 reply_markup=reply_markup)
     except Exception as e:
         logging.error(f"Errore aggiornando messaggio: {e}")
-
-# --- CALLBACK BOTTONI AMAZON E LICENZE ---
+        # --- CALLBACK PULSANTI ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    data = query.data
     product = context.user_data.get("product")
 
-    # --- AMAZON ---
-    if data == "modify" and product:
+    if query.data == "modify":
+        if not product or not product.get("ready"):
+            await query.message.reply_text("⏳ Sto ancora caricando i dati del prodotto...")
+            return
         await query.message.reply_text("Scrivi il prezzo manualmente:")
         context.user_data["waiting_price"] = True
-    elif data == "edit_title" and product:
+
+    elif query.data == "edit_title":
+        if not product or not product.get("ready"):
+            await query.message.reply_text("⏳ Sto ancora caricando i dati del prodotto...")
+            return
         await query.message.reply_text(f"Scrivi il nuovo titolo (originale: {product['title']}):")
         context.user_data["waiting_title"] = True
-    elif data == "publish" and product:
+
+    elif query.data == "publish":
+        if not product or not product.get("ready"):
+            await query.message.reply_text("⏳ Sto ancora caricando i dati del prodotto...")
+            return
         msg = f"📌 <b>{product['title']}</b>\n〰️〰️〰️〰️\n💶 {product['price']}\n〰️〰️〰️〰️\n📲 <a href='{product['url']}'>Acquista su Amazon</a>"
         if product["img"]:
             await context.bot.send_photo(chat_id=GROUP_ID, photo=product["img"], caption=msg, parse_mode="HTML")
         else:
             await context.bot.send_message(chat_id=GROUP_ID, text=msg, parse_mode="HTML")
         await query.message.reply_text("Prodotto pubblicato nel canale ✅")
+
+    elif query.data == "reschedule":
+        await query.message.reply_text("⚠️ Funzione Riprogramma da implementare secondo minuti scelti.")
+
+# --- HANDLER MANUALI ---
+async def manual_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("waiting_price"):
+        price = update.message.text.strip()
+        context.user_data["product"]["price"] = price
+        await update.message.reply_text("PREZZO AGGIORNATO ✅")
+        context.user_data["waiting_price"] = False
+
+async def manual_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("waiting_title"):
+        title = update.message.text.strip()
+        context.user_data["product"]["title"] = title
+        await update.message.reply_text("TITOLO AGGIORNATO ✅")
+        context.user_data["waiting_title"] = False
+
+# --- MENU ADMIN LICENZE ---
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("Crea Licenza", callback_data="admin_create")],
+        [InlineKeyboardButton("Rinnova Licenza", callback_data="admin_renew")],
+        [InlineKeyboardButton("Elimina Licenza", callback_data="admin_delete")],
+        [InlineKeyboardButton("Lista Licenze", callback_data="admin_list")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("📜 Menu Admin Licenze", reply_markup=reply_markup)
+
+async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "admin_create":
+        key, exp = create_license(days=30)
+        await query.message.reply_text(f"✅ Licenza creata: {key} (scadenza {exp})")
+
+    elif data == "admin_list":
+        rows = list_licenses()
+        msg = "🔑 Tutte le Licenze:\n\n"
+        for k, e, u, a in rows:
+            status = "Usata" if u else "Disponibile"
+            admin_str = " (Admin)" if a else ""
+            msg += f"{k} - Scadenza: {e} - {status}{admin_str}\n"
+        await query.message.reply_text(msg)
+
+    elif data in ["admin_renew", "admin_delete"]:
+        rows = list_licenses()
+        buttons = []
+        for k, e, u, a in rows:
+            if data == "admin_renew":
+                buttons.append([InlineKeyboardButton(f"{k} - RINNOVA", callback_data=f"renew_{k}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"{k} - ELIMINA", callback_data=f"delete_{k}")])
+        await query.message.reply_text("Seleziona la licenza:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("renew_"):
+        key = data.replace("renew_", "")
+        buttons = [
+            [InlineKeyboardButton("1 Mese", callback_data=f"renew_time_{key}_1")],
+            [InlineKeyboardButton("3 Mesi", callback_data=f"renew_time_{key}_3")],
+            [InlineKeyboardButton("6 Mesi", callback_data=f"renew_time_{key}_6")],
+            [InlineKeyboardButton("12 Mesi", callback_data=f"renew_time_{key}_12")]
+        ]
+        await query.message.reply_text(f"Seleziona durata rinnovo per {key}:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("renew_time_"):
+        parts = data.split("_")
+        key = parts[2]
+        months = int(parts[3])
+        renew_license(key, months)
+        await query.message.reply_text(f"✅ Licenza {key} rinnovata di {months} mese/i")
+
+    elif data.startswith("delete_"):
+        key = data.replace("delete_", "")
+        delete_license(key)
+        await query.message.reply_text(f"❌ Licenza {key} eliminata con successo")
+
+# --- CREAZIONE BOT ---
+app = ApplicationBuilder().token(TOKEN).build()
+
+# --- HANDLER ---
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("setaff", set_affiliate))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex("📜 Gestione Licenze"), admin_menu))
+app.add_handler(CallbackQueryHandler(button_callback, pattern="^(modify|edit_title|publish|reschedule)$"))
+app.add_handler(CallbackQueryHandler(admin_button, pattern="^(admin_|renew_|delete_|renew_time_)"))
+
+# --- HANDLER MANUALI ---
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manual_price))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manual_title))
+
+# --- AVVIO BOT ---
+if __name__ == "__main__":
+    print("Bot avviato...")
+    app.run_polling()
