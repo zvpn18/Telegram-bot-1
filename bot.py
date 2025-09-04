@@ -5,9 +5,9 @@ import uuid
 import datetime
 import httpx
 from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from flask import Flask, request
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from flask import Flask
 from threading import Thread
 import asyncio
 
@@ -17,8 +17,7 @@ GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002093792613"))
 AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "prodottipe0c9-21")
 ADMIN_USER_ID = 6930429334
 DB_FILE = "bot_data.db"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # es. https://tuo-dominio.onrender.com/<TOKEN>
-PORT = int(os.environ.get("PORT", 5000))  # porta Render
+PORT = int(os.environ.get("PORT", 5000))
 
 logging.basicConfig(level=logging.INFO)
 
@@ -142,27 +141,7 @@ async def licenze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{key} - Scadenza: {expiry} - {status}{admin_str}\n"
     await update.message.reply_text(msg)
 
-async def crea_licenza_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_USER_ID:
-        await update.message.reply_text("❌ Solo admin può creare licenze")
-        return
-    days = int(context.args[0]) if context.args else 30
-    key, expiry = create_license(days_valid=days)
-    await update.message.reply_text(f"🔑 Nuova licenza creata: {key}\nScadenza: {expiry}")
-
-async def rimuovi_licenza_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_USER_ID:
-        await update.message.reply_text("❌ Solo admin può rimuovere licenze")
-        return
-    if not context.args:
-        await update.message.reply_text("❌ Devi specificare la chiave da rimuovere: /rimuovilicense CHIAVE")
-        return
-    key = context.args[0].upper()
-    cursor.execute("DELETE FROM licenses WHERE key=?", (key,))
-    conn.commit()
-    await update.message.reply_text(f"❌ Licenza {key} rimossa.")
-
-# --- /START con tastiera admin ---
+# --- START con tastiera ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     keyboard = [["Invia Link Amazon"]]
@@ -171,7 +150,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
     await update.message.reply_text("Ciao! Seleziona un'opzione:", reply_markup=reply_markup)
 
-# --- GESTIONE TESTO PULSANTI ---
+# --- HANDLER TESTO PULSANTI ---
 async def handle_button_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.message.from_user.id
@@ -179,57 +158,35 @@ async def handle_button_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if user_id == ADMIN_USER_ID:
             await licenze_command(update, context)
         else:
-            await update.message.reply_text("❌ Non hai i permessi per accedere a questa sezione.")
+            await update.message.reply_text("❌ Non hai i permessi.")
     elif "amazon" in text.lower() or "amzn" in text.lower():
         await handle_link(update, context)
 
 # --- HANDLER LINK AMAZON ---
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info(f"handle_link chiamato da {update.message.from_user.id}: {update.message.text}")
     if not await check_user_license(update):
         return
     url = update.message.text.strip()
     if not any(x in url for x in ["amazon", "amzn.to", "amzn.eu"]):
         await update.message.reply_text("Per favore manda un link Amazon valido 🔗")
         return
-    loading_msg = await update.message.reply_text("📦 Caricamento prodotto...")
-    try:
-        url_expanded = await expand_url(url)
-        url_affiliate = add_affiliate_tag(url_expanded, AFFILIATE_TAG)
-        title, img_url, final_url = await parse_amazon(url_affiliate)
-    except Exception as e:
-        logging.error(f"Errore parsing: {e}")
-        await update.message.reply_text("❌ Errore caricando prodotto")
-        return
-    context.user_data["product"] = {"title": title, "img": img_url, "url": final_url, "price": "Prezzo non inserito"}
-    context.user_data["product_ready"] = True
-    await update.message.reply_text(f"Prodotto pronto: {title}\n💶 Prezzo non inserito\n📲 {final_url}")
+    await update.message.reply_text("📦 Caricamento prodotto...")
+    url_expanded = await expand_url(url)
+    url_affiliate = add_affiliate_tag(url_expanded, AFFILIATE_TAG)
+    title, img_url, final_url = await parse_amazon(url_affiliate)
+    await update.message.reply_text(f"Prodotto pronto:\n📌 {title}\n💶 Prezzo non inserito\n📲 {final_url}")
 
-# --- FLASK KEEP-ALIVE ---
+# --- FLASK KEEP-ALIVE OPZIONALE ---
 app = Flask("")
 @app.route("/")
 def home(): return "Bot attivo!"
-@app.route(f"/{TOKEN}", methods=["POST"])
-def telegram_webhook():
-    update = Update.de_json(request.get_json(force=True), bot_app.bot)
-    asyncio.get_event_loop().create_task(bot_app.update_queue.put(update))
-    return "OK"
 def run_flask(): app.run(host="0.0.0.0", port=PORT)
+Thread(target=run_flask).start()
 
-# --- AVVIO BOT ---
+# --- AVVIO BOT CON POLLING ---
 bot_app = ApplicationBuilder().token(TOKEN).build()
 bot_app.add_handler(CommandHandler("start", start))
 bot_app.add_handler(CommandHandler("licenze", licenze_command))
-bot_app.add_handler(CommandHandler("crealicenza", crea_licenza_command))
-bot_app.add_handler(CommandHandler("rimuovilicense", rimuovi_licenza_command))
 bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button_text))
 
-# Avvia Flask in thread separato
-Thread(target=run_flask).start()
-
-# Imposta webhook Telegram
-bot_app.run_webhook(
-    listen="0.0.0.0",
-    port=PORT,
-    webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
-)
+bot_app.run_polling()
