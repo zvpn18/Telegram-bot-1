@@ -160,14 +160,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Manda subito il messaggio di caricamento
     loading_msg = await update.message.reply_text("📦 Caricamento prodotto...")
-    # Parsing asincrono
-    await parse_and_update(context.bot, loading_msg.chat_id, loading_msg.message_id, url, context)
 
-async def parse_and_update(bot, chat_id, msg_id, url, context):
-    context.user_data["product_ready"] = False
-    url = await expand_url(url)
-    url = add_affiliate_tag(url, AFFILIATE_TAG)
-    title, img_url, final_url = await parse_amazon(url)
+    # Parsing asincrono
+    try:
+        url_expanded = await expand_url(url)
+        url_affiliate = add_affiliate_tag(url_expanded, AFFILIATE_TAG)
+        title, img_url, final_url = await parse_amazon(url_affiliate)
+    except Exception as e:
+        logging.error(f"Errore parsing: {e}")
+        await update.message.reply_text("❌ Errore caricando prodotto")
+        return
+
     context.user_data["product"] = {"title": title, "img": img_url, "url": final_url, "price": "Prezzo non inserito"}
     context.user_data["product_ready"] = True
 
@@ -182,11 +185,11 @@ async def parse_and_update(bot, chat_id, msg_id, url, context):
 
     try:
         if img_url:
-            await bot.edit_message_media(chat_id=chat_id, message_id=msg_id, media=InputMediaPhoto(img_url, caption=caption), reply_markup=reply_markup)
+            await context.bot.edit_message_media(chat_id=loading_msg.chat_id, message_id=loading_msg.message_id, media=InputMediaPhoto(img_url, caption=caption), reply_markup=reply_markup)
         else:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=caption, reply_markup=reply_markup)
+            await context.bot.edit_message_text(chat_id=loading_msg.chat_id, message_id=loading_msg.message_id, text=caption, reply_markup=reply_markup)
     except Exception as e:
-        logging.error(e)
+        logging.error(f"Errore aggiornando messaggio: {e}")
 
 # --- CALLBACK BOTTONI ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,6 +223,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "reschedule":
         await query.message.reply_text("⚠️ Funzione Riprogramma da implementare secondo minuti scelti.")
 
+# --- HANDLER MANUALI ---
 async def manual_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("waiting_price"):
         price = update.message.text.strip()
@@ -233,3 +237,9 @@ async def manual_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["product"]["title"] = new_title
         await update.message.reply_text(f"Titolo aggiornato a: {new_title}")
         context.user_data["waiting_title"] = False
+
+# --- /START ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Ciao! Inviami un link Amazon e potrai modificare il prezzo prima di pubblicarlo 🚀")
+
+# --- SERVER FLASK KEEP-
