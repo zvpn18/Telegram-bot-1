@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS active_users (
 """)
 conn.commit()
 
-# --- FUNZIONI LICENZE ---
+# --- LICENZE ---
 def create_license(days_valid=30, admin=False):
     key = str(uuid.uuid4()).split("-")[0].upper()
     expiry = "9999-12-29T23:59:59" if admin else (datetime.datetime.now() + datetime.timedelta(days=days_valid)).isoformat()
@@ -62,7 +62,7 @@ def activate_license(user_id, user_key):
     valid, is_admin = check_license(user_key)
     if not valid:
         return False, is_admin
-    cursor.execute("INSERT OR REPLACE INTO active_users (user_id, license_key) VALUES (?, ?, ?)", (user_id, user_key))
+    cursor.execute("INSERT OR REPLACE INTO active_users (user_id, license_key) VALUES (?, ?)", (user_id, user_key))
     if not is_admin:
         cursor.execute("UPDATE licenses SET used=1 WHERE key=?", (user_key,))
     conn.commit()
@@ -83,7 +83,8 @@ async def expand_url(url):
         try:
             resp = await client.head(url, follow_redirects=True)
             return str(resp.url)
-        except:
+        except Exception as e:
+            logging.error(f"Errore expand_url: {e}")
             return url
 
 async def parse_amazon(url):
@@ -91,8 +92,9 @@ async def parse_amazon(url):
         try:
             resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
-        except:
-            return "Prodotto Amazon", None, None
+        except Exception as e:
+            logging.error(f"Errore parse_amazon: {e}")
+            return "Prodotto Amazon", None, url
     title_tag = soup.find("span", {"id": "productTitle"})
     title = title_tag.get_text(strip=True) if title_tag else "Prodotto Amazon"
     img_tag = soup.find("img", {"id": "landingImage"})
@@ -123,12 +125,8 @@ async def check_user_license(update: Update):
         return False
     return True
 
-# --- /LICENZE ---
+# --- COMANDI ADMIN ---
 async def licenze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_USER_ID:
-        await update.message.reply_text("❌ Non hai i permessi per gestire le licenze.")
-        return
     cursor.execute("SELECT key, expiry, used, admin FROM licenses")
     rows = cursor.fetchall()
     if not rows:
@@ -141,8 +139,33 @@ async def licenze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{key} - Scadenza: {expiry} - {status}{admin_str}\n"
     await update.message.reply_text(msg)
 
+async def crea_licenza_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Solo admin può creare licenze")
+        return
+    days = int(context.args[0]) if context.args else 30
+    key, expiry = create_license(days_valid=days)
+    await update.message.reply_text(f"🔑 Nuova licenza creata: {key}\nScadenza: {expiry}")
+
+async def rimuovi_licenza_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Solo admin può rimuovere licenze")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Devi specificare la chiave da rimuovere: /rimuovilicense CHIAVE")
+        return
+    key = context.args[0].upper()
+    cursor.execute("DELETE FROM licenses WHERE key=?", (key,))
+    conn.commit()
+    await update.message.reply_text(f"❌ Licenza {key} rimossa.")
+
+# --- /START ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Ciao! Inviami un link Amazon e potrai modificarlo e pubblicarlo 🚀")
+
 # --- GESTIONE LINK AMAZON ---
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"handle_link chiamato da {update.message.from_user.id}: {update.message.text}")
     if not await check_user_license(update):
         return
     if context.user_data.get("waiting_price"):
@@ -235,37 +258,29 @@ async def manual_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Titolo aggiornato a: {new_title}")
         context.user_data["waiting_title"] = False
 
-# --- /START ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ciao! Inviami un link Amazon e potrai modificarlo e pubblicarlo 🚀")
-
-# --- SERVER FLASK KEEP-ALIVE ---
+# --- FLASK KEEP-ALIVE ---
 app = Flask("")
 
 @app.route("/")
 def home():
-    return "Bot is alive"
+    return "Bot attivo!"
 
-def run_flask():
-    app.run(host="0.0.0.0", port=8080)
+def run():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
-# --- AVVIO BOT ---
-def main():
-    application = Application.builder().token(TOKEN).build()
+Thread(target=run).start()
 
-    # Registrazione comandi
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("licenze", licenze_command))
+# --- MAIN ---
+application = Application.builder().token(TOKEN).build()
 
-    # Gestione messaggi (link Amazon)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+# Comandi
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("licenze", licenze_command))
+application.add_handler(CommandHandler("crealicenza", crea_licenza_command))
+application.add_handler(CommandHandler("rimuovilicense", rimuovi_licenza_command))
 
-    # Callback bottoni inline
-    application.add_handler(CallbackQueryHandler(button_callback))
+# Messaggi e callback
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+application.add_handler(CallbackQueryHandler(button_callback))
 
-    # Avvio polling
-    application.run_polling()
-
-if __name__ == "__main__":
-    Thread(target=run_flask).start()
-    main()
+application.run_polling()
