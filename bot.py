@@ -5,10 +5,11 @@ import uuid
 import datetime
 import httpx
 from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from flask import Flask, request
 from threading import Thread
+import asyncio
 
 # --- CONFIG ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "INSERISCI_IL_TUO_TOKEN")
@@ -16,7 +17,8 @@ GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002093792613"))
 AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "prodottipe0c9-21")
 ADMIN_USER_ID = 6930429334
 DB_FILE = "bot_data.db"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # es. https://tuo-dominio.onrender.com/{TOKEN}
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # es. https://tuo-dominio.onrender.com/<TOKEN>
+PORT = int(os.environ.get("PORT", 5000))  # porta Render
 
 logging.basicConfig(level=logging.INFO)
 
@@ -160,29 +162,37 @@ async def rimuovi_licenza_command(update: Update, context: ContextTypes.DEFAULT_
     conn.commit()
     await update.message.reply_text(f"❌ Licenza {key} rimossa.")
 
-# --- /START ---
+# --- /START con tastiera admin ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ciao! Inviami un link Amazon e potrai modificarlo e pubblicarlo 🚀")
+    user_id = update.message.from_user.id
+    keyboard = [["Invia Link Amazon"]]
+    if user_id == ADMIN_USER_ID:
+        keyboard.insert(0, ["📜 Gestione Licenze"])
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+    await update.message.reply_text("Ciao! Seleziona un'opzione:", reply_markup=reply_markup)
 
-# --- GESTIONE LINK AMAZON ---
+# --- GESTIONE TESTO PULSANTI ---
+async def handle_button_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.message.from_user.id
+    if text == "📜 Gestione Licenze":
+        if user_id == ADMIN_USER_ID:
+            await licenze_command(update, context)
+        else:
+            await update.message.reply_text("❌ Non hai i permessi per accedere a questa sezione.")
+    elif "amazon" in text.lower() or "amzn" in text.lower():
+        await handle_link(update, context)
+
+# --- HANDLER LINK AMAZON ---
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"handle_link chiamato da {update.message.from_user.id}: {update.message.text}")
     if not await check_user_license(update):
         return
-    if context.user_data.get("waiting_price"):
-        await manual_price(update, context)
-        return
-    if context.user_data.get("waiting_title"):
-        await manual_title(update, context)
-        return
-
     url = update.message.text.strip()
     if not any(x in url for x in ["amazon", "amzn.to", "amzn.eu"]):
         await update.message.reply_text("Per favore manda un link Amazon valido 🔗")
         return
-
     loading_msg = await update.message.reply_text("📦 Caricamento prodotto...")
-
     try:
         url_expanded = await expand_url(url)
         url_affiliate = add_affiliate_tag(url_expanded, AFFILIATE_TAG)
@@ -191,113 +201,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Errore parsing: {e}")
         await update.message.reply_text("❌ Errore caricando prodotto")
         return
-
     context.user_data["product"] = {"title": title, "img": img_url, "url": final_url, "price": "Prezzo non inserito"}
     context.user_data["product_ready"] = True
-
-    keyboard = [
-        [InlineKeyboardButton("💰 Modifica Prezzo", callback_data="modify")],
-        [InlineKeyboardButton("✏️ Modifica Titolo", callback_data="edit_title")],
-        [InlineKeyboardButton("⏰ Riprogramma", callback_data="reschedule")],
-        [InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    caption = f"📌 {title}\n〰️〰️〰️〰️\n💶 Prezzo non inserito\n〰️〰️〰️〰️\n📲 Acquista su Amazon"
-
-    try:
-        if img_url:
-            await context.bot.edit_message_media(chat_id=loading_msg.chat_id, message_id=loading_msg.message_id, media=InputMediaPhoto(img_url, caption=caption), reply_markup=reply_markup)
-        else:
-            await context.bot.edit_message_text(chat_id=loading_msg.chat_id, message_id=loading_msg.message_id, text=caption, reply_markup=reply_markup)
-    except Exception as e:
-        logging.error(f"Errore aggiornando messaggio: {e}")
-
-# --- CALLBACK BOTTONI ---
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if user_id != ADMIN_USER_ID:
-        cursor.execute("SELECT license_key FROM active_users WHERE user_id=?", (user_id,))
-        if not cursor.fetchone():
-            await query.message.reply_text("❌ Devi avere una licenza attiva per usare i bottoni.")
-            return
-
-    product = context.user_data.get("product")
-    if not product or not context.user_data.get("product_ready", False):
-        await query.message.reply_text("⏳ Sto ancora caricando i dati del prodotto...")
-        return
-
-    if query.data == "modify":
-        await query.message.reply_text("Scrivi il prezzo manualmente:")
-        context.user_data["waiting_price"] = True
-    elif query.data == "edit_title":
-        await query.message.reply_text(f"Scrivi il nuovo titolo (originale: {product['title']}):")
-        context.user_data["waiting_title"] = True
-    elif query.data == "publish":
-        msg = f"📌 <b>{product['title']}</b>\n〰️〰️〰️〰️\n💶 {product['price']}\n〰️〰️〰️〰️\n📲 <a href='{product['url']}'>Acquista su Amazon</a>"
-        if product["img"]:
-            await context.bot.send_photo(chat_id=GROUP_ID, photo=product["img"], caption=msg, parse_mode="HTML")
-        else:
-            await context.bot.send_message(chat_id=GROUP_ID, text=msg, parse_mode="HTML")
-        await query.message.reply_text("Prodotto pubblicato nel canale ✅")
-    elif query.data == "reschedule":
-        await query.message.reply_text("⚠️ Funzione Riprogramma da implementare secondo minuti scelti.")
-
-# --- HANDLER MANUALI ---
-async def manual_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("waiting_price"):
-        price = update.message.text.strip()
-        context.user_data["product"]["price"] = price
-        await update.message.reply_text(f"Prezzo aggiornato a: {price}")
-        context.user_data["waiting_price"] = False
-
-async def manual_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("waiting_title"):
-        new_title = update.message.text.strip()
-        context.user_data["product"]["title"] = new_title
-        await update.message.reply_text(f"Titolo aggiornato a: {new_title}")
-        context.user_data["waiting_title"] = False
+    await update.message.reply_text(f"Prodotto pronto: {title}\n💶 Prezzo non inserito\n📲 {final_url}")
 
 # --- FLASK KEEP-ALIVE ---
 app = Flask("")
-
 @app.route("/")
-def home():
-    return "Bot attivo!"
-
+def home(): return "Bot attivo!"
 @app.route(f"/{TOKEN}", methods=["POST"])
 def telegram_webhook():
-    from telegram import Update
     update = Update.de_json(request.get_json(force=True), bot_app.bot)
-    import asyncio
     asyncio.get_event_loop().create_task(bot_app.update_queue.put(update))
     return "OK"
-
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
-Thread(target=run_flask).start()
-
-# --- MAIN ---
-bot_app = ApplicationBuilder().token(TOKEN).build()
-
-bot_app.add_handler(CommandHandler("start", start))
-bot_app.add_handler(CommandHandler("licenze", licenze_command))
-bot_app.add_handler(CommandHandler("crealicenza", crea_licenza_command))
-bot_app.add_handler(CommandHandler("rimuovilicense", rimuovi_licenza_command))
-bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-bot_app.add_handler(CallbackQueryHandler(button_callback))
-
-# Imposta webhook su Telegram
-import asyncio
-async def set_webhook():
-    await bot_app.bot.set_webhook(url=WEBHOOK_URL)
-
-asyncio.get_event_loop().run_until_complete(set_webhook())
-
-bot_app.run_webhook(
-    listen="0.0.0.0",
-    port=int(os.environ.get("PORT", 5000)),
-    webhook_url=WEBHOOK_URL
-)
+def run_flask(): app.run(host="0.0
