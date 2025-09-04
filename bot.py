@@ -9,10 +9,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMe
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from flask import Flask
 from threading import Thread
-import asyncio
 
 # --- CONFIG ---
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7817602011:AAHioblDdeZNdhUCuNRSqTKjK5PO-LotivI")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "INSERISCI_IL_TUO_TOKEN")
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002093792613"))
 AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "prodottipe0c9-21")
 ADMIN_USER_ID = 6930429334
@@ -63,7 +62,7 @@ def activate_license(user_id, user_key):
     valid, is_admin = check_license(user_key)
     if not valid:
         return False, is_admin
-    cursor.execute("INSERT OR REPLACE INTO active_users (user_id, license_key) VALUES (?, ?)", (user_id, user_key))
+    cursor.execute("INSERT OR REPLACE INTO active_users (user_id, license_key) VALUES (?, ?, ?)", (user_id, user_key))
     if not is_admin:
         cursor.execute("UPDATE licenses SET used=1 WHERE key=?", (user_key,))
     conn.commit()
@@ -158,10 +157,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Per favore manda un link Amazon valido 🔗")
         return
 
-    # Manda subito il messaggio di caricamento
     loading_msg = await update.message.reply_text("📦 Caricamento prodotto...")
 
-    # Parsing asincrono
     try:
         url_expanded = await expand_url(url)
         url_affiliate = add_affiliate_tag(url_expanded, AFFILIATE_TAG)
@@ -240,6 +237,35 @@ async def manual_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- /START ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ciao! Inviami un link Amazon e potrai modificare il prezzo prima di pubblicarlo 🚀")
+    await update.message.reply_text("Ciao! Inviami un link Amazon e potrai modificarlo e pubblicarlo 🚀")
 
-# --- SERVER FLASK KEEP-
+# --- SERVER FLASK KEEP-ALIVE ---
+app = Flask("")
+
+@app.route("/")
+def home():
+    return "Bot is alive"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=8080)
+
+# --- AVVIO BOT ---
+def main():
+    application = Application.builder().token(TOKEN).build()
+
+    # Registrazione comandi
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("licenze", licenze_command))
+
+    # Gestione messaggi (link Amazon)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+
+    # Callback bottoni inline
+    application.add_handler(CallbackQueryHandler(button_callback))
+
+    # Avvio polling
+    application.run_polling()
+
+if __name__ == "__main__":
+    Thread(target=run_flask).start()
+    main()
