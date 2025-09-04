@@ -1,6 +1,8 @@
 import logging
 import requests
 import os
+import json
+import datetime
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -12,8 +14,24 @@ import asyncio
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7817602011:AAHioblDdeZNdhUCuNRSqTKjK5PO-LotivI")
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002093792613"))
 AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "prodottipe0c9-21")
+LICENSES_FILE = "licenses.json"
+ACTIVE_USERS_FILE = "active_users.json"
 
 logging.basicConfig(level=logging.INFO)
+
+# 🔹 Carica licenze e utenti attivi
+def load_json(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_json(file_path, data):
+    with open(file_path, "w") as f:
+        json.dump(data, f, indent=4)
+
+LICENSES = load_json(LICENSES_FILE)
+ACTIVE_USERS = load_json(ACTIVE_USERS_FILE)
 
 # 🔹 Espande short link
 def expand_url(url):
@@ -53,14 +71,33 @@ def parse_amazon(url):
 
     return title, img_url, url
 
+# 🔹 Verifica se l'utente ha licenza valida
+def check_user_license(user_id):
+    if str(user_id) not in ACTIVE_USERS:
+        return False
+    key = ACTIVE_USERS[str(user_id)]
+    if key not in LICENSES:
+        return False
+    license_data = LICENSES[key]
+    if license_data["usata"] == False:
+        return False
+    if datetime.datetime.now() > datetime.datetime.fromisoformat(license_data["scadenza"]):
+        return False
+    return True
+
 # 🔹 Gestione link Amazon
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if not check_user_license(user_id):
+        await update.message.reply_text("❌ Devi attivare una licenza valida per usare il bot. Usa /start")
+        return
+
     if context.user_data.get('waiting_price') or context.user_data.get('waiting_title') or context.user_data.get('waiting_schedule'):
         await manual_input(update, context)
         return
 
     original_msg = update.message
-    url = update.message.text.strip()
+    url = original_msg.text.strip()
 
     if not ("amazon" in url or "amzn.to" in url or "amzn.eu" in url):
         await original_msg.reply_text("Per favore manda un link Amazon valido 🔗")
@@ -106,6 +143,11 @@ async def parse_and_update(bot, chat_id, msg_id, url, context):
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
+
+    if not check_user_license(user_id):
+        await query.message.reply_text("❌ La tua licenza non è valida o è scaduta.")
+        return
 
     if not context.user_data.get('product_ready', False):
         await query.message.reply_text("⏳ Attendi, sto ancora caricando i dati del prodotto...")
@@ -177,11 +219,50 @@ async def publish_product(bot, product):
     else:
         await bot.send_message(chat_id=GROUP_ID, text=msg, parse_mode="HTML")
 
-# 🔹 Comando /start
+# 🔹 Comando /start per gestione licenza
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Ciao! Inviami un link Amazon e potrai modificare prezzo, titolo e programmare la pubblicazione 🚀"
-    )
+    user_id = update.message.from_user.id
+
+    # Controlla se l'utente ha già licenza attiva
+    if check_user_license(user_id):
+        await update.message.reply_text("✅ Licenza valida! Puoi usare il bot.")
+        return
+
+    await update.message.reply_text("Benvenuto! Inserisci la tua chiave di licenza per attivare il bot:")
+
+    # Aspetta input licenza
+    context.user_data['waiting_license'] = True
+
+async def handle_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('waiting_license'):
+        await handle_link(update, context)
+        return
+
+    license_key = update.message.text.strip()
+    user_id = update.message.from_user.id
+
+    if license_key not in LICENSES:
+        await update.message.reply_text("❌ Licenza non valida.")
+        return
+
+    data = LICENSES[license_key]
+    scadenza = datetime.datetime.fromisoformat(data["scadenza"])
+
+    if data["usata"]:
+        await update.message.reply_text("❌ Questa licenza è già stata utilizzata.")
+        return
+    if datetime.datetime.now() > scadenza:
+        await update.message.reply_text("❌ Licenza scaduta.")
+        return
+
+    # Licenza valida
+    data["usata"] = True
+    ACTIVE_USERS[str(user_id)] = license_key
+    save_json(LICENSES_FILE, LICENSES)
+    save_json(ACTIVE_USERS_FILE, ACTIVE_USERS)
+
+    context.user_data['waiting_license'] = False
+    await update.message.reply_text("✅ Licenza attivata! Puoi ora usare tutte le funzionalità del bot.")
 
 # 🔹 Server Flask per keep-alive Render
 flask_app = Flask('')
@@ -199,7 +280,7 @@ Thread(target=run_flask).start()
 def main():
     telegram_app = Application.builder().token(TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_license))
     telegram_app.add_handler(CallbackQueryHandler(button_callback))
     telegram_app.run_polling()
 
