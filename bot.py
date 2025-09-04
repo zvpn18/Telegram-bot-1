@@ -1,65 +1,63 @@
 import logging
-import requests
 import os
-import json
-import datetime
+import sqlite3
 import uuid
+import datetime
+import httpx
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from flask import Flask
 from threading import Thread
+import asyncio
 
 # --- CONFIG ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7817602011:AAHioblDdeZNdhUCuNRSqTKjK5PO-LotivI")
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002093792613"))
 AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "prodottipe0c9-21")
-ADMIN_USER_ID = 6930429334  # <-- Tuo ID Telegram come Admin
-
-LICENSES_FILE = "licenses.json"
-ACTIVE_USERS_FILE = "active_users.json"
+ADMIN_USER_ID = 6930429334  # tuo ID Telegram
+DB_FILE = "bot_data.db"
 
 logging.basicConfig(level=logging.INFO)
 
-# --- Licenze ---
-try:
-    with open(LICENSES_FILE, "r") as f:
-        LICENSES = json.load(f)
-except FileNotFoundError:
-    LICENSES = {}
+# --- DATABASE ---
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+cursor = conn.cursor()
 
-try:
-    with open(ACTIVE_USERS_FILE, "r") as f:
-        ACTIVE_USERS = json.load(f)
-except FileNotFoundError:
-    ACTIVE_USERS = {}
+# Tabelle licenze e utenti attivi
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS licenses (
+    key TEXT PRIMARY KEY,
+    expiry TEXT,
+    used INTEGER DEFAULT 0,
+    admin INTEGER DEFAULT 0
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS active_users (
+    user_id INTEGER PRIMARY KEY,
+    license_key TEXT
+)
+""")
+conn.commit()
 
-def save_licenses():
-    with open(LICENSES_FILE, "w") as f:
-        json.dump(LICENSES, f, indent=4)
-
-def save_active_users():
-    with open(ACTIVE_USERS_FILE, "w") as f:
-        json.dump(ACTIVE_USERS, f, indent=4)
-
+# --- Funzioni licenze ---
 def create_license(days_valid=30, admin=False):
     key = str(uuid.uuid4()).split("-")[0].upper()
-    expiry = (datetime.datetime.now() + datetime.timedelta(days=days_valid)).isoformat()
-    if admin:
-        expiry = "9999-12-29T23:59:59"
-    LICENSES[key] = {"scadenza": expiry, "usata": False, "admin": admin}
-    save_licenses()
+    expiry = "9999-12-29T23:59:59" if admin else (datetime.datetime.now() + datetime.timedelta(days=days_valid)).isoformat()
+    cursor.execute("INSERT INTO licenses (key, expiry, used, admin) VALUES (?, ?, ?, ?)", (key, expiry, 0, int(admin)))
+    conn.commit()
     return key, expiry
 
 def check_license(user_key):
-    if user_key not in LICENSES:
+    cursor.execute("SELECT expiry, used, admin FROM licenses WHERE key=?", (user_key,))
+    row = cursor.fetchone()
+    if not row:
         return False, False
-    license_data = LICENSES[user_key]
-    is_admin = license_data.get("admin", False)
+    expiry, used, is_admin = row
+    is_admin = bool(is_admin)
     if not is_admin:
-        if license_data["usata"]:
-            return False, False
-        if datetime.datetime.now() > datetime.datetime.fromisoformat(license_data["scadenza"]):
+        if used or datetime.datetime.now() > datetime.datetime.fromisoformat(expiry):
             return False, False
     return True, is_admin
 
@@ -67,102 +65,94 @@ def activate_license(user_id, user_key):
     valid, is_admin = check_license(user_key)
     if not valid:
         return False, is_admin
-    ACTIVE_USERS[str(user_id)] = user_key
+    cursor.execute("INSERT OR REPLACE INTO active_users (user_id, license_key) VALUES (?, ?)", (user_id, user_key))
     if not is_admin:
-        LICENSES[user_key]["usata"] = True
-        save_licenses()
-    save_active_users()
+        cursor.execute("UPDATE licenses SET used=1 WHERE key=?", (user_key,))
+    conn.commit()
     return True, is_admin
 
 # --- Genera chiave admin se non esiste ---
-admin_key = None
-for k, v in LICENSES.items():
-    if v.get("admin", False):
-        admin_key = k
-        break
-if not admin_key:
+cursor.execute("SELECT key FROM licenses WHERE admin=1")
+admin_row = cursor.fetchone()
+if admin_row:
+    admin_key = admin_row[0]
+else:
     admin_key, _ = create_license(admin=True)
     print(f"Chiave Admin generata: {admin_key} (scade 29/12/9999)")
 
-# --- Espande short link Amazon ---
-def expand_url(url):
-    try:
-        session = requests.Session()
-        resp = session.head(url, allow_redirects=True, timeout=10)
-        return resp.url
-    except:
-        return url
+# --- Funzioni Amazon ---
+async def expand_url(url):
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.head(url, follow_redirects=True)
+            return resp.url
+        except:
+            return url
 
-# --- Aggiunge tag affiliato ---
+async def parse_amazon(url):
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(url)
+            soup = BeautifulSoup(resp.text, "html.parser")
+        except:
+            return "Prodotto Amazon", None, None
+    title_tag = soup.find("span", {"id": "productTitle"})
+    title = title_tag.get_text(strip=True) if title_tag else "Prodotto Amazon"
+    img_tag = soup.find("img", {"id": "landingImage"})
+    img_url = img_tag.get("src") if img_tag and hasattr(img_tag, 'get') else None
+    return title, img_url, url
+
 def add_affiliate_tag(url, tag):
-    asin = None
     parts = url.split("/")
+    asin = None
     if "dp" in parts:
         idx = parts.index("dp")
         if idx + 1 < len(parts):
-            asin = parts[idx + 1].split("?")[0]
+            asin = parts[idx+1].split("?")[0]
     if not asin:
         return url
-    short_url = f"https://www.amazon.it/dp/{asin}?tag={tag}"
-    return short_url
+    return f"https://www.amazon.it/dp/{asin}?tag={tag}"
 
-# --- Parsing Amazon ---
-def parse_amazon(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        page = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(page.content, "html.parser")
-    except:
-        return "Prodotto Amazon", None, None
-
-    title_tag = soup.find("span", {"id": "productTitle"})
-    title = title_tag.get_text(strip=True) if title_tag else "Prodotto Amazon"
-
-    img_tag = soup.find("img", {"id": "landingImage"})
-    img_url = img_tag.get("src") if img_tag and hasattr(img_tag, 'get') else None
-
-    return title, img_url, url
-
-# --- Controlla licenza prima di usare bot ---
+# --- Check licenza ---
 async def check_user_license(update: Update):
     user_id = update.message.from_user.id
     if user_id == ADMIN_USER_ID:
-        ACTIVE_USERS[str(user_id)] = admin_key
-        save_active_users()
+        activate_license(user_id, admin_key)
         return True
-    if str(user_id) in ACTIVE_USERS:
-        return True
-    await update.message.reply_text("❌ Devi inserire una licenza valida per usare il bot.")
-    return False
+    cursor.execute("SELECT license_key FROM active_users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        await update.message.reply_text("❌ Devi inserire una licenza valida per usare il bot.")
+        return False
+    return True
 
 # --- Gestione link Amazon ---
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_user_license(update):
         return
-    if context.user_data.get('waiting_price'):
+    if context.user_data.get("waiting_price"):
         await manual_price(update, context)
         return
-
-    original_msg = update.message
-    url = update.message.text.strip()
-
-    if not ("amazon" in url or "amzn.to" in url or "amzn.eu" in url):
-        await original_msg.reply_text("Per favore manda un link Amazon valido 🔗")
+    if context.user_data.get("waiting_title"):
+        await manual_title(update, context)
         return
 
-    loading_msg = await original_msg.reply_text("📦 Caricamento prodotto...")
+    url = update.message.text.strip()
+    if not any(x in url for x in ["amazon", "amzn.to", "amzn.eu"]):
+        await update.message.reply_text("Per favore manda un link Amazon valido 🔗")
+        return
 
-    import asyncio
+    loading_msg = await update.message.reply_text("📦 Caricamento prodotto...")
     asyncio.create_task(parse_and_update(context.bot, loading_msg.chat_id, loading_msg.message_id, url, context))
 
 async def parse_and_update(bot, chat_id, msg_id, url, context):
-    context.user_data['product_ready'] = False
-    url = expand_url(url)
+    context.user_data["product_ready"] = False
+    url = await expand_url(url)
     url = add_affiliate_tag(url, AFFILIATE_TAG)
-    title, img_url, final_url = parse_amazon(url)
+    title, img_url, final_url = await parse_amazon(url)
 
-    context.user_data['product'] = {"title": title, "img": img_url, "url": final_url, "price": "Prezzo non inserito"}
-    context.user_data['product_ready'] = True
+    context.user_data["product"] = {"title": title, "img": img_url, "url": final_url, "price": "Prezzo non inserito"}
+    context.user_data["product_ready"] = True
 
     keyboard = [
         [InlineKeyboardButton("💰 Modifica Prezzo", callback_data="modify")],
@@ -171,100 +161,71 @@ async def parse_and_update(bot, chat_id, msg_id, url, context):
         [InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    caption_text = f"📌 {title}\n〰️〰️〰️〰️\n💶 Prezzo non inserito\n〰️〰️〰️〰️\n📲 Acquista su Amazon"
+    caption = f"📌 {title}\n〰️〰️〰️〰️\n💶 Prezzo non inserito\n〰️〰️〰️〰️\n📲 Acquista su Amazon"
 
     try:
         if img_url:
-            await bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=msg_id,
-                media=InputMediaPhoto(img_url, caption=caption_text),
-                reply_markup=reply_markup
-            )
+            await bot.edit_message_media(chat_id=chat_id, message_id=msg_id, media=InputMediaPhoto(img_url, caption=caption), reply_markup=reply_markup)
         else:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=caption_text, reply_markup=reply_markup)
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=caption, reply_markup=reply_markup)
     except Exception as e:
-        logging.error(f"Error updating message: {e}")
+        logging.error(e)
 
-# --- Callback bottoni ---
+# --- Callback bottoni e gestione prezzo/titolo ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if user_id != ADMIN_USER_ID and str(user_id) not in ACTIVE_USERS:
-        await query.message.reply_text("❌ Devi avere una licenza attiva per usare i bottoni.")
-        return
+    if user_id != ADMIN_USER_ID:
+        cursor.execute("SELECT license_key FROM active_users WHERE user_id=?", (user_id,))
+        if not cursor.fetchone():
+            await query.message.reply_text("❌ Devi avere una licenza attiva per usare i bottoni.")
+            return
 
-    product = context.user_data.get('product')
-    if not product or not context.user_data.get('product_ready', False):
+    product = context.user_data.get("product")
+    if not product or not context.user_data.get("product_ready", False):
         await query.message.reply_text("⏳ Sto ancora caricando i dati del prodotto...")
         return
 
     if query.data == "modify":
         await query.message.reply_text("Scrivi il prezzo manualmente:")
-        context.user_data['waiting_price'] = True
-
+        context.user_data["waiting_price"] = True
     elif query.data == "edit_title":
         await query.message.reply_text(f"Scrivi il nuovo titolo (originale: {product['title']}):")
-        context.user_data['waiting_title'] = True
-
+        context.user_data["waiting_title"] = True
     elif query.data == "publish":
         msg = f"📌 <b>{product['title']}</b>\n〰️〰️〰️〰️\n💶 {product['price']}\n〰️〰️〰️〰️\n📲 <a href='{product['url']}'>Acquista su Amazon</a>"
-        if product['img']:
-            await context.bot.send_photo(chat_id=GROUP_ID, photo=product['img'], caption=msg, parse_mode="HTML")
+        if product["img"]:
+            await context.bot.send_photo(chat_id=GROUP_ID, photo=product["img"], caption=msg, parse_mode="HTML")
         else:
             await context.bot.send_message(chat_id=GROUP_ID, text=msg, parse_mode="HTML")
         await query.message.reply_text("Prodotto pubblicato nel canale ✅")
+    elif query.data == "reschedule":
+        await query.message.reply_text("⚠️ Funzione Riprogramma da implementare secondo minuti scelti.")
 
-# --- Prezzo e titolo manuale ---
 async def manual_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('waiting_price'):
+    if context.user_data.get("waiting_price"):
         price = update.message.text.strip()
-        if 'product' in context.user_data:
-            context.user_data['product']['price'] = price
-            await update.message.reply_text(
-                f"Prezzo aggiornato a: {price}",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]])
-            )
-        context.user_data['waiting_price'] = False
+        context.user_data["product"]["price"] = price
+        await update.message.reply_text(f"Prezzo aggiornato a: {price}")
+        context.user_data["waiting_price"] = False
 
 async def manual_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('waiting_title'):
+    if context.user_data.get("waiting_title"):
         new_title = update.message.text.strip()
-        if 'product' in context.user_data:
-            context.user_data['product']['title'] = new_title
-            await update.message.reply_text(f"Titolo aggiornato a:\n{new_title}")
-        context.user_data['waiting_title'] = False
+        context.user_data["product"]["title"] = new_title
+        await update.message.reply_text(f"Titolo aggiornato a: {new_title}")
+        context.user_data["waiting_title"] = False
 
-# --- Comando /start ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id == ADMIN_USER_ID:
-        ACTIVE_USERS[str(user_id)] = admin_key
-        save_active_users()
+        activate_license(user_id, admin_key)
         await update.message.reply_text("Accesso Admin attivato automaticamente ✅")
         return
-    if str(user_id) in ACTIVE_USERS:
-        await update.message.reply_text("Benvenuto! Sei già registrato.")
-    else:
-        await update.message.reply_text("Benvenuto! Inserisci la tua chiave licenza:")
-
-# --- Inserimento licenza ---
-async def license_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id == ADMIN_USER_ID:
+    if not await check_user_license(update):
         return
-    if str(user_id) in ACTIVE_USERS:
-        await manual_price(update, context)
-        await manual_title(update, context)
-        return
-    user_key = update.message.text.strip().upper()
-    valid, _ = activate_license(user_id, user_key)
-    if not valid:
-        await update.message.reply_text("Chiave non valida o già usata/scaduta ❌")
-        return
-    await update.message.reply_text(f"Licenza attivata ✅\nChiave: {user_key}")
+    await update.message.reply_text("Benvenuto! Inviami un link Amazon.")
 
 # --- Flask keep-alive ---
 flask_app = Flask('')
@@ -274,18 +235,16 @@ def home():
     return "Bot attivo 🚀"
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
 
-t = Thread(target=run_flask)
-t.start()
+Thread(target=run_flask).start()
 
 # --- Avvio bot ---
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, license_entry))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manual_title))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manual_price))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.run_polling()
 
