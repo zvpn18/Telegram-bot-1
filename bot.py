@@ -6,16 +6,13 @@ import datetime
 import httpx
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, BotCommand
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import asyncio
 
 # --- CONFIG ---
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1000000000"))
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7817602011:AAHioblDdeZNdhUCuNRSqTKjK5PO-LotivI")
+GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002093792613"))
 ADMIN_USER_ID = 6930429334
-DEFAULT_AFFILIATE_TAG = "YOUR_DEFAULT_AFFILIATE_TAG"
 DB_FILE = "bot_data.db"
 
 logging.basicConfig(level=logging.INFO)
@@ -44,14 +41,9 @@ conn.commit()
 def create_license(days_valid=30, admin=False):
     key = str(uuid.uuid4()).split("-")[0].upper()
     expiry = "9999-12-29T23:59:59" if admin else (datetime.datetime.now() + datetime.timedelta(days=days_valid)).isoformat()
-    cursor.execute("INSERT INTO licenses (key, expiry, used, admin) VALUES (?, ?, ?, ?)",
-                   (key, expiry, 0, int(admin)))
+    cursor.execute("INSERT INTO licenses (key, expiry, used, admin) VALUES (?, ?, ?, ?)", (key, expiry, 0, int(admin)))
     conn.commit()
     return key, expiry
-
-def list_licenses():
-    cursor.execute("SELECT key, expiry, used, admin FROM licenses")
-    return cursor.fetchall()
 
 def check_license(user_key):
     cursor.execute("SELECT expiry, used, admin FROM licenses WHERE key=?", (user_key,))
@@ -60,8 +52,9 @@ def check_license(user_key):
         return False, False
     expiry, used, is_admin = row
     is_admin = bool(is_admin)
-    if not is_admin and (used or datetime.datetime.now() > datetime.datetime.fromisoformat(expiry)):
-        return False, False
+    if not is_admin:
+        if used or datetime.datetime.now() > datetime.datetime.fromisoformat(expiry):
+            return False, False
     return True, is_admin
 
 def activate_license(user_id, user_key):
@@ -83,7 +76,7 @@ else:
     admin_key, _ = create_license(admin=True)
     print(f"Chiave Admin generata: {admin_key} (scade 29/12/9999)")
 
-# --- AMAZON PARSING ---
+# --- FUNZIONI AMAZON ---
 async def expand_url(url):
     async with httpx.AsyncClient(timeout=10) as client:
         try:
@@ -98,20 +91,25 @@ async def parse_amazon(url):
             resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
         except:
-            return None, None, None
+            return "Prodotto Amazon", None, None
     title_tag = soup.find("span", {"id": "productTitle"})
-    title = title_tag.get_text(strip=True) if title_tag else None
+    title = title_tag.get_text(strip=True) if title_tag else "Prodotto Amazon"
     img_tag = soup.find("img", {"id": "landingImage"})
-    img_url = img_tag.get("src") if img_tag else None
+    img_url = img_tag.get("src") if img_tag and hasattr(img_tag, 'get') else None
     return title, img_url, url
 
 def add_affiliate_tag(url, tag):
-    if "/dp/" not in url:
+    parts = url.split("/")
+    asin = None
+    if "dp" in parts:
+        idx = parts.index("dp")
+        if idx + 1 < len(parts):
+            asin = parts[idx+1].split("?")[0]
+    if not asin:
         return url
-    asin = url.split("/dp/")[1].split("/")[0].split("?")[0]
     return f"https://www.amazon.it/dp/{asin}?tag={tag}"
 
-# --- CHECK LICENZA UTENTE ---
+# --- CHECK LICENZA ---
 async def check_user_license(update: Update):
     user_id = update.message.from_user.id
     if user_id == ADMIN_USER_ID:
@@ -127,38 +125,6 @@ async def check_user_license(update: Update):
 # --- /START ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖Benvenuto in Easy Amz Affiliate❗️")
-    commands = [
-        BotCommand("start", "Avvia il bot"),
-        BotCommand("licenze", "Gestione licenze (solo admin)"),
-        BotCommand("setaff", "Imposta tuo ID affiliato Amazon"),
-        BotCommand("licenza", "Attiva la tua licenza")
-    ]
-    await context.bot.set_my_commands(commands)
-
-# --- INSERIMENTO LICENZA ---
-async def inserisci_licenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if len(context.args) != 1:
-        await update.message.reply_text("❌ Usa: /licenza TUO_CODICE")
-        return
-    key = context.args[0].upper()
-    valid, is_admin = activate_license(user_id, key)
-    if valid:
-        await update.message.reply_text(f"✅ Licenza attivata con successo! {'(Admin)' if is_admin else ''}")
-    else:
-        await update.message.reply_text("❌ Licenza non valida o già utilizzata.")
-
-# --- SET AFFILIATE ID ---
-async def set_affiliate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if len(context.args) != 1:
-        await update.message.reply_text("Usa: /setaff TUO_ID")
-        return
-    aff_id = context.args[0]
-    cursor.execute("INSERT OR REPLACE INTO active_users (user_id, license_key, affiliate_id) VALUES (?, ?, ?)",
-                   (user_id, admin_key if user_id==ADMIN_USER_ID else "", aff_id))
-    conn.commit()
-    await update.message.reply_text(f"✅ ID affiliato impostato a {aff_id}")
 
 # --- GESTIONE LINK AMAZON ---
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -166,25 +132,23 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     url = update.message.text.strip()
     if not any(x in url for x in ["amazon", "amzn.to", "amzn.eu"]):
-        await update.message.reply_text("Per favore invia un link Amazon valido 🔗")
+        await update.message.reply_text("Per favore manda un link Amazon valido 🔗")
         return
-
     loading_msg = await update.message.reply_text("📦 Caricamento prodotto...")
-
-    # Recupero ID affiliato utente
-    cursor.execute("SELECT affiliate_id FROM active_users WHERE user_id=?", (update.message.from_user.id,))
-    aff_row = cursor.fetchone()
-    aff_tag = aff_row[0] if aff_row and aff_row[0] else DEFAULT_AFFILIATE_TAG
-
-    url_exp = await expand_url(url)
-    url_aff = add_affiliate_tag(url_exp, aff_tag)
-    title, img, final_url = await parse_amazon(url_aff)
-
-    if not title or not final_url:
-        await update.message.reply_text("❌ Errore caricando prodotto, reinvia il link")
+    try:
+        url_expanded = await expand_url(url)
+        # Controlla se utente ha affiliate_id
+        cursor.execute("SELECT affiliate_id FROM active_users WHERE user_id=?", (update.message.from_user.id,))
+        aff_row = cursor.fetchone()
+        tag = aff_row[0] if aff_row and aff_row[0] else "prodottipe0c9-21"
+        url_affiliate = add_affiliate_tag(url_expanded, tag)
+        title, img_url, final_url = await parse_amazon(url_affiliate)
+    except:
+        await update.message.reply_text("❌ Errore caricando prodotto. Reinvia il link.")
         return
 
-    context.user_data["product"] = {"title": title, "img": img, "url": final_url, "price": "Prezzo non inserito", "ready": True}
+    context.user_data["product"] = {"title": title, "img": img_url, "url": final_url, "price": "Prezzo non inserito"}
+    context.user_data["product_ready"] = True
 
     keyboard = [
         [InlineKeyboardButton("💰 Modifica Prezzo", callback_data="modify")],
@@ -192,30 +156,21 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⏰ Riprogramma", callback_data="reschedule")],
         [InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     caption = f"📌 {title}\n〰️〰️〰️〰️\n💶 Prezzo non inserito\n〰️〰️〰️〰️\n📲 Acquista su Amazon"
-
     try:
-        if img:
-            await context.bot.edit_message_media(chat_id=loading_msg.chat_id, message_id=loading_msg.message_id,
-                                                 media=InputMediaPhoto(img, caption=caption), reply_markup=reply_markup)
+        if img_url:
+            await context.bot.edit_message_media(chat_id=loading_msg.chat_id, message_id=loading_msg.message_id, media=InputMediaPhoto(img_url, caption=caption), reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            await context.bot.edit_message_text(chat_id=loading_msg.chat_id, message_id=loading_msg.message_id,
-                                                text=caption, reply_markup=reply_markup)
+            await context.bot.edit_message_text(chat_id=loading_msg.chat_id, message_id=loading_msg.message_id, text=caption, reply_markup=InlineKeyboardMarkup(keyboard))
     except:
-        await update.message.reply_text("Errore aggiornando il prodotto")
+        await update.message.reply_text("Errore nel caricamento del prodotto. Reinvia il link.")
 
-# --- CALLBACK BOTTONI AMAZON ---
+# --- CALLBACK BOTTONI ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     product = context.user_data.get("product")
-
-    if not product or not product.get("ready"):
-        await query.message.reply_text("⏳ Sto ancora caricando i dati del prodotto...")
-        return
-
     if query.data == "modify":
         await query.message.reply_text("Scrivi il prezzo manualmente:")
         context.user_data["waiting_price"] = True
@@ -229,39 +184,73 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await context.bot.send_message(chat_id=GROUP_ID, text=msg, parse_mode="HTML")
         await query.message.reply_text("Prodotto pubblicato nel canale ✅")
+    elif query.data == "reschedule":
+        await query.message.reply_text("⚠️ Funzione Riprogramma da implementare")
 
-# --- HANDLER PREZZO/TITOLO ---
+# --- HANDLER MANUALI ---
 async def manual_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("waiting_price"):
         price = update.message.text.strip()
         context.user_data["product"]["price"] = price
+        await update.message.reply_text("PREZZO AGGIORNATO ✅")
         context.user_data["waiting_price"] = False
-        await update.message.reply_text("PREZZO AGGIORNATO ✅\nPuoi ora premere Pubblica ✅")
 
 async def manual_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("waiting_title"):
         new_title = update.message.text.strip()
         context.user_data["product"]["title"] = new_title
+        await update.message.reply_text("TITOLO AGGIORNATO ✅")
         context.user_data["waiting_title"] = False
-        await update.message.reply_text("TITOLO AGGIORNATO ✅\nPuoi ora premere Pubblica ✅")
+
+# --- ADMIN COMANDI ---
+async def licenze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Non hai i permessi")
+        return
+    keyboard = [
+        [InlineKeyboardButton("Crea Licenza", callback_data="admin_create")],
+        [InlineKeyboardButton("Rinnova Licenza", callback_data="admin_renew")],
+        [InlineKeyboardButton("Elimina Licenza", callback_data="admin_delete")],
+        [InlineKeyboardButton("Lista Licenze", callback_data="admin_list")]
+    ]
+    await update.message.reply_text("Gestione Licenze Admin", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# --- AFFILIATE ID ---
+async def admin_set_affiliate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Scrivi il tuo ID affiliato Amazon:")
+    context.user_data["setting_affiliate"] = True
+
+async def handle_affiliate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("setting_affiliate"):
+        affiliate_id = update.message.text.strip()
+        cursor.execute("INSERT OR REPLACE INTO active_users (user_id, affiliate_id) VALUES (?,?)",
+                       (update.message.from_user.id, affiliate_id))
+        conn.commit()
+        await update.message.reply_text(f"ID affiliato aggiornato ✅")
+        context.user_data["setting_affiliate"] = False
+
+# --- MENU COMANDI '/'
+async def menu_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    commands = [
+        BotCommand("start", "Avvia il bot"),
+        BotCommand("licenze", "Gestione licenze (solo admin)"),
+        BotCommand("affiliate", "Imposta il tuo ID affiliato")
+    ]
+    await context.bot.set_my_commands(commands)
+    await update.message.reply_text("Menu comandi aggiornato, usa '/' per visualizzare")
 
 # --- AVVIO BOT ---
-app = ApplicationBuilder().token(TOKEN).build()
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("licenze", licenze_command))
+    app.add_handler(CommandHandler("affiliate", admin_set_affiliate))
+    app.add_handler(CommandHandler("menu", menu_commands))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_link))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_affiliate))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.run_polling()
 
-# Comandi
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("setaff", set_affiliate))
-app.add_handler(CommandHandler("licenza", inserisci_licenza))
-
-# Messaggi
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
-# Callback
-app.add_handler(CallbackQueryHandler(button_callback))
-
-# Prezzo/Titolo
-app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^\d+.*'), manual_price))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manual_title))
-
-print("Bot avviato...")
-app.run_polling()
+if __name__ == "__main__":
+    main()
