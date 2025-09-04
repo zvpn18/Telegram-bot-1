@@ -6,6 +6,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMe
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from flask import Flask
 from threading import Thread
+import asyncio
 
 # CONFIGURAZIONE BOT
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7817602011:AAHioblDdeZNdhUCuNRSqTKjK5PO-LotivI")
@@ -14,7 +15,7 @@ AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "prodottipe0c9-21")
 
 logging.basicConfig(level=logging.INFO)
 
-# 🔹 Espande short link (amzn.to, amzn.eu)
+# 🔹 Espande short link
 def expand_url(url):
     try:
         session = requests.Session()
@@ -33,8 +34,7 @@ def add_affiliate_tag(url, tag):
             asin = parts[idx + 1].split("?")[0]
     if not asin:
         return url
-    short_url = f"https://www.amazon.it/dp/{asin}?tag={tag}"
-    return short_url
+    return f"https://www.amazon.it/dp/{asin}?tag={tag}"
 
 # 🔹 Estrazione info prodotto Amazon
 def parse_amazon(url):
@@ -55,8 +55,8 @@ def parse_amazon(url):
 
 # 🔹 Gestione link Amazon
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('waiting_price'):
-        await manual_price(update, context)
+    if context.user_data.get('waiting_price') or context.user_data.get('waiting_title') or context.user_data.get('waiting_schedule'):
+        await manual_input(update, context)
         return
 
     original_msg = update.message
@@ -67,8 +67,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     loading_msg = await original_msg.reply_text("📦 Caricamento prodotto...")
-
-    import asyncio
     asyncio.create_task(parse_and_update(context.bot, loading_msg.chat_id, loading_msg.message_id, url, context))
 
 # 🔹 Parsing + Preview
@@ -83,6 +81,8 @@ async def parse_and_update(bot, chat_id, msg_id, url, context):
 
     keyboard = [
         [InlineKeyboardButton("💰 Modifica Prezzo", callback_data="modify")],
+        [InlineKeyboardButton("✏️ Modifica Titolo", callback_data="edit_title")],
+        [InlineKeyboardButton("⏰ Riprogramma", callback_data="schedule")],
         [InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -112,36 +112,78 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     product = context.user_data.get('product')
+
     if query.data == "modify":
         await query.message.reply_text("Scrivi il prezzo manualmente:")
         context.user_data['waiting_price'] = True
 
-    elif query.data == "publish":
-        msg = f"📌 <b>{product['title']}</b>\n〰️〰️〰️〰️\n💶 {product['price']}\n〰️〰️〰️〰️\n📲 <a href='{product['url']}'>Acquista su Amazon</a>"
-        if product['img']:
-            await context.bot.send_photo(chat_id=GROUP_ID, photo=product['img'], caption=msg, parse_mode="HTML")
-        else:
-            await context.bot.send_message(chat_id=GROUP_ID, text=msg, parse_mode="HTML")
+    elif query.data == "edit_title":
+        current_title = product['title']
+        await query.message.reply_text(
+            f"Scrivi il nuovo titolo del prodotto (puoi modificare il seguente):\n\n{current_title}"
+        )
+        context.user_data['waiting_title'] = True
 
+    elif query.data == "schedule":
+        keyboard = [
+            [InlineKeyboardButton("5 min", callback_data="schedule_5")],
+            [InlineKeyboardButton("10 min", callback_data="schedule_10")],
+            [InlineKeyboardButton("15 min", callback_data="schedule_15")],
+            [InlineKeyboardButton("20 min", callback_data="schedule_20")]
+        ]
+        await query.message.reply_text("Scegli dopo quanti minuti pubblicare il prodotto:", reply_markup=InlineKeyboardMarkup(keyboard))
+        context.user_data['waiting_schedule'] = True
+
+    elif query.data.startswith("schedule_"):
+        minutes = int(query.data.split("_")[1])
+        await query.message.reply_text(f"Il messaggio sarà pubblicato tra {minutes} minuti ⏰")
+        asyncio.create_task(schedule_publish(context.bot, product, minutes))
+        context.user_data['waiting_schedule'] = False
+
+    elif query.data == "publish":
+        await publish_product(context.bot, product)
         await query.message.reply_text("Prodotto pubblicato nel canale ✅")
 
-# 🔹 Gestione prezzo manuale
-async def manual_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# 🔹 Gestione input manuale (prezzo o titolo)
+async def manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('waiting_price'):
         price = update.message.text.strip()
-        if 'product' in context.user_data:
-            context.user_data['product']['price'] = price
-            await update.message.reply_text(
-                f"Prezzo aggiornato a: {price}",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]])
-            )
+        context.user_data['product']['price'] = price
+        await update.message.reply_text(
+            f"Prezzo aggiornato a: {price}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]])
+        )
         context.user_data['waiting_price'] = False
+
+    elif context.user_data.get('waiting_title'):
+        title = update.message.text.strip()
+        context.user_data['product']['title'] = title
+        await update.message.reply_text(
+            f"Titolo aggiornato a: {title}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]])
+        )
+        context.user_data['waiting_title'] = False
+
+# 🔹 Pubblicazione programmata
+async def schedule_publish(bot, product, minutes):
+    await asyncio.sleep(minutes * 60)
+    await publish_product(bot, product)
+
+# 🔹 Funzione pubblicazione
+async def publish_product(bot, product):
+    msg = f"📌 <b>{product['title']}</b>\n〰️〰️〰️〰️\n💶 {product['price']}\n〰️〰️〰️〰️\n📲 <a href='{product['url']}'>Acquista su Amazon</a>"
+    if product['img']:
+        await bot.send_photo(chat_id=GROUP_ID, photo=product['img'], caption=msg, parse_mode="HTML")
+    else:
+        await bot.send_message(chat_id=GROUP_ID, text=msg, parse_mode="HTML")
 
 # 🔹 Comando /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ciao! Inviami un link Amazon e potrai modificare il prezzo prima di pubblicarlo 🚀")
+    await update.message.reply_text(
+        "Ciao! Inviami un link Amazon e potrai modificare prezzo, titolo e programmare la pubblicazione 🚀"
+    )
 
-# 🔹 Server Flask per keep-alive Replit
+# 🔹 Server Flask per keep-alive Render
 flask_app = Flask('')
 
 @flask_app.route('/')
@@ -151,17 +193,14 @@ def home():
 def run_flask():
     flask_app.run(host="0.0.0.0", port=5000)
 
-t = Thread(target=run_flask)
-t.start()
+Thread(target=run_flask).start()
 
 # 🔹 Avvio bot
 def main():
     telegram_app = Application.builder().token(TOKEN).build()
-
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     telegram_app.add_handler(CallbackQueryHandler(button_callback))
-
     telegram_app.run_polling()
 
 if __name__ == "__main__":
