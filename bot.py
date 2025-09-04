@@ -6,8 +6,8 @@ import datetime
 import httpx
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from flask import Flask
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from flask import Flask, request
 from threading import Thread
 
 # --- CONFIG ---
@@ -16,6 +16,7 @@ GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002093792613"))
 AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "prodottipe0c9-21")
 ADMIN_USER_ID = 6930429334
 DB_FILE = "bot_data.db"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # es. https://tuo-dominio.onrender.com/{TOKEN}
 
 logging.basicConfig(level=logging.INFO)
 
@@ -265,22 +266,38 @@ app = Flask("")
 def home():
     return "Bot attivo!"
 
-def run():
+@app.route(f"/{TOKEN}", methods=["POST"])
+def telegram_webhook():
+    from telegram import Update
+    update = Update.de_json(request.get_json(force=True), bot_app.bot)
+    import asyncio
+    asyncio.get_event_loop().create_task(bot_app.update_queue.put(update))
+    return "OK"
+
+def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
-Thread(target=run).start()
+Thread(target=run_flask).start()
 
 # --- MAIN ---
-application = Application.builder().token(TOKEN).build()
+bot_app = ApplicationBuilder().token(TOKEN).build()
 
-# Comandi
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("licenze", licenze_command))
-application.add_handler(CommandHandler("crealicenza", crea_licenza_command))
-application.add_handler(CommandHandler("rimuovilicense", rimuovi_licenza_command))
+bot_app.add_handler(CommandHandler("start", start))
+bot_app.add_handler(CommandHandler("licenze", licenze_command))
+bot_app.add_handler(CommandHandler("crealicenza", crea_licenza_command))
+bot_app.add_handler(CommandHandler("rimuovilicense", rimuovi_licenza_command))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+bot_app.add_handler(CallbackQueryHandler(button_callback))
 
-# Messaggi e callback
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-application.add_handler(CallbackQueryHandler(button_callback))
+# Imposta webhook su Telegram
+import asyncio
+async def set_webhook():
+    await bot_app.bot.set_webhook(url=WEBHOOK_URL)
 
-application.run_polling()
+asyncio.get_event_loop().run_until_complete(set_webhook())
+
+bot_app.run_webhook(
+    listen="0.0.0.0",
+    port=int(os.environ.get("PORT", 5000)),
+    webhook_url=WEBHOOK_URL
+)
