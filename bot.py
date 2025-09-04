@@ -1,288 +1,234 @@
-import logging
-import requests
-import os
 import json
 import datetime
-from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from flask import Flask
-from threading import Thread
-import asyncio
+import uuid
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# CONFIGURAZIONE BOT
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7817602011:AAHioblDdeZNdhUCuNRSqTKjK5PO-LotivI")
-GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002093792613"))
-AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "prodottipe0c9-21")
+# --- CONFIG ---
+TOKEN = "7817602011:AAHioblDdeZNdhUCuNRSqTKjK5PO-LotivI"
+GROUP_ID = -1002093792613
 LICENSES_FILE = "licenses.json"
 ACTIVE_USERS_FILE = "active_users.json"
 
 logging.basicConfig(level=logging.INFO)
 
-# 🔹 Carica licenze e utenti attivi
-def load_json(file_path):
-    if os.path.exists(file_path):
-        with open(file_path, "r") as f:
-            return json.load(f)
-    return {}
+# --- Carica licenze ---
+try:
+    with open(LICENSES_FILE, "r") as f:
+        LICENSES = json.load(f)
+except FileNotFoundError:
+    LICENSES = {}
 
-def save_json(file_path, data):
-    with open(file_path, "w") as f:
-        json.dump(data, f, indent=4)
+# --- Carica utenti attivi ---
+try:
+    with open(ACTIVE_USERS_FILE, "r") as f:
+        ACTIVE_USERS = json.load(f)
+except FileNotFoundError:
+    ACTIVE_USERS = {}
 
-LICENSES = load_json(LICENSES_FILE)
-ACTIVE_USERS = load_json(ACTIVE_USERS_FILE)
+# --- Funzioni licenze ---
+def save_licenses():
+    with open(LICENSES_FILE, "w") as f:
+        json.dump(LICENSES, f, indent=4)
 
-# 🔹 Espande short link
-def expand_url(url):
-    try:
-        session = requests.Session()
-        resp = session.head(url, allow_redirects=True, timeout=10)
-        return resp.url
-    except:
-        return url
+def save_active_users():
+    with open(ACTIVE_USERS_FILE, "w") as f:
+        json.dump(ACTIVE_USERS, f, indent=4)
 
-# 🔹 Genera link breve con ASIN + tag affiliato
-def add_affiliate_tag(url, tag):
-    asin = None
-    parts = url.split("/")
-    if "dp" in parts:
-        idx = parts.index("dp")
-        if idx + 1 < len(parts):
-            asin = parts[idx + 1].split("?")[0]
-    if not asin:
-        return url
-    return f"https://www.amazon.it/dp/{asin}?tag={tag}"
+def create_license(days_valid=30, admin=False):
+    key = str(uuid.uuid4()).split("-")[0].upper()
+    expiry = (datetime.datetime.now() + datetime.timedelta(days=days_valid)).isoformat()
+    if admin:
+        expiry = "9999-12-29T23:59:59"
+    LICENSES[key] = {"scadenza": expiry, "usata": False, "admin": admin}
+    save_licenses()
+    return key, expiry
 
-# 🔹 Estrazione info prodotto Amazon
-def parse_amazon(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        page = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(page.content, "html.parser")
-    except:
-        return "Prodotto Amazon", None, None
+def check_license(user_key):
+    if user_key not in LICENSES:
+        return False, False
+    license_data = LICENSES[user_key]
+    is_admin = license_data.get("admin", False)
+    if not is_admin:
+        if license_data["usata"]:
+            return False, False
+        if datetime.datetime.now() > datetime.datetime.fromisoformat(license_data["scadenza"]):
+            return False, False
+    return True, is_admin
 
-    title_tag = soup.find("span", {"id": "productTitle"})
-    title = title_tag.get_text(strip=True) if title_tag else "Prodotto Amazon"
+def activate_license(user_id, user_key):
+    valid, is_admin = check_license(user_key)
+    if not valid:
+        return False, is_admin
+    ACTIVE_USERS[str(user_id)] = user_key
+    if not is_admin:
+        LICENSES[user_key]["usata"] = True
+        save_licenses()
+    save_active_users()
+    return True, is_admin
 
-    img_tag = soup.find("img", {"id": "landingImage"})
-    img_url = img_tag.get("src") if img_tag and hasattr(img_tag, 'get') else None
+# --- Crea chiave admin se non esiste ---
+admin_key = None
+for k, v in LICENSES.items():
+    if v.get("admin", False):
+        admin_key = k
+        break
+if not admin_key:
+    admin_key, _ = create_license(admin=True)
+    print(f"Chiave Admin generata: {admin_key} (scade 29/12/9999)")
 
-    return title, img_url, url
-
-# 🔹 Verifica se l'utente ha licenza valida
-def check_user_license(user_id):
-    if str(user_id) not in ACTIVE_USERS:
-        return False
-    key = ACTIVE_USERS[str(user_id)]
-    if key not in LICENSES:
-        return False
-    license_data = LICENSES[key]
-    if license_data["usata"] == False:
-        return False
-    if datetime.datetime.now() > datetime.datetime.fromisoformat(license_data["scadenza"]):
-        return False
-    return True
-
-# 🔹 Gestione link Amazon
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Comando /start ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    if not check_user_license(user_id):
-        await update.message.reply_text("❌ Devi attivare una licenza valida per usare il bot. Usa /start")
+    if str(user_id) in ACTIVE_USERS:
+        await update.message.reply_text("Benvenuto! Sei già registrato.")
+    else:
+        await update.message.reply_text("Benvenuto! Inserisci la tua chiave licenza:")
+
+# --- Inserimento chiave licenza ---
+async def license_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_key = update.message.text.strip().upper()
+    valid, is_admin = activate_license(user_id, user_key)
+    if not valid:
+        await update.message.reply_text("Chiave non valida o già usata/scaduta ❌")
         return
+    if is_admin:
+        await update.message.reply_text(f"Accesso Admin attivato ✅\nChiave: {user_key}")
+    else:
+        await update.message.reply_text(f"Licenza attivata ✅\nChiave: {user_key}")
 
-    if context.user_data.get('waiting_price') or context.user_data.get('waiting_title') or context.user_data.get('waiting_schedule'):
-        await manual_input(update, context)
+# --- Comando /licenze (solo admin) ---
+async def manage_licenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if str(user_id) not in ACTIVE_USERS:
+        await update.message.reply_text("Non hai accesso a questo comando ❌")
         return
-
-    original_msg = update.message
-    url = original_msg.text.strip()
-
-    if not ("amazon" in url or "amzn.to" in url or "amzn.eu" in url):
-        await original_msg.reply_text("Per favore manda un link Amazon valido 🔗")
+    key = ACTIVE_USERS[str(user_id)]
+    if not LICENSES[key].get("admin", False):
+        await update.message.reply_text("Non hai permessi admin ❌")
         return
-
-    loading_msg = await original_msg.reply_text("📦 Caricamento prodotto...")
-    asyncio.create_task(parse_and_update(context.bot, loading_msg.chat_id, loading_msg.message_id, url, context))
-
-# 🔹 Parsing + Preview
-async def parse_and_update(bot, chat_id, msg_id, url, context):
-    context.user_data['product_ready'] = False
-    url = expand_url(url)
-    url = add_affiliate_tag(url, AFFILIATE_TAG)
-    title, img_url, final_url = parse_amazon(url)
-
-    context.user_data['product'] = {"title": title, "img": img_url, "url": final_url, "price": "Prezzo non inserito"}
-    context.user_data['product_ready'] = True
 
     keyboard = [
-        [InlineKeyboardButton("💰 Modifica Prezzo", callback_data="modify")],
-        [InlineKeyboardButton("✏️ Modifica Titolo", callback_data="edit_title")],
-        [InlineKeyboardButton("⏰ Riprogramma", callback_data="schedule")],
-        [InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]
+        [InlineKeyboardButton("🆕 Crea licenza", callback_data="create_license")],
+        [InlineKeyboardButton("♻️ Rinnova licenza", callback_data="renew_license")],
+        [InlineKeyboardButton("🗑 Elimina licenza", callback_data="delete_license")],
+        [InlineKeyboardButton("⏳ Licenze scadute", callback_data="expired_license")],
+        [InlineKeyboardButton("📜 Tutte le licenze", callback_data="all_licenses")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Gestione Licenze:", reply_markup=reply_markup)
 
-    caption_text = f"📌 {title}\n〰️〰️〰️〰️\n💶 Prezzo non inserito\n〰️〰️〰️〰️\n📲 Acquista su Amazon"
-
-    try:
-        if img_url:
-            await bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=msg_id,
-                media=InputMediaPhoto(img_url, caption=caption_text),
-                reply_markup=reply_markup
-            )
-        else:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=caption_text, reply_markup=reply_markup)
-    except Exception as e:
-        logging.error(f"Error updating message: {e}")
-
-# 🔹 Callback bottoni
+# --- Callback bottoni admin ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-
-    if not check_user_license(user_id):
-        await query.message.reply_text("❌ La tua licenza non è valida o è scaduta.")
+    key = ACTIVE_USERS.get(str(user_id))
+    if not key or not LICENSES[key].get("admin", False):
+        await query.message.reply_text("Non hai permessi admin ❌")
         return
 
-    if not context.user_data.get('product_ready', False):
-        await query.message.reply_text("⏳ Attendi, sto ancora caricando i dati del prodotto...")
-        return
-
-    product = context.user_data.get('product')
-
-    if query.data == "modify":
-        await query.message.reply_text("Scrivi il prezzo manualmente:")
-        context.user_data['waiting_price'] = True
-
-    elif query.data == "edit_title":
-        current_title = product['title']
-        await query.message.reply_text(
-            f"Scrivi il nuovo titolo del prodotto (puoi modificare il seguente):\n\n{current_title}"
-        )
-        context.user_data['waiting_title'] = True
-
-    elif query.data == "schedule":
+    if query.data == "create_license":
+        # Mostra bottoni con durata
         keyboard = [
-            [InlineKeyboardButton("5 min", callback_data="schedule_5")],
-            [InlineKeyboardButton("10 min", callback_data="schedule_10")],
-            [InlineKeyboardButton("15 min", callback_data="schedule_15")],
-            [InlineKeyboardButton("20 min", callback_data="schedule_20")]
+            [InlineKeyboardButton("1 mese", callback_data="duration_30")],
+            [InlineKeyboardButton("3 mesi", callback_data="duration_90")],
+            [InlineKeyboardButton("6 mesi", callback_data="duration_180")],
+            [InlineKeyboardButton("12 mesi", callback_data="duration_365")]
         ]
-        await query.message.reply_text("Scegli dopo quanti minuti pubblicare il prodotto:", reply_markup=InlineKeyboardMarkup(keyboard))
-        context.user_data['waiting_schedule'] = True
+        await query.message.reply_text("Seleziona la durata della nuova licenza:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif query.data.startswith("schedule_"):
-        minutes = int(query.data.split("_")[1])
-        await query.message.reply_text(f"Il messaggio sarà pubblicato tra {minutes} minuti ⏰")
-        asyncio.create_task(schedule_publish(context.bot, product, minutes))
-        context.user_data['waiting_schedule'] = False
+    elif query.data.startswith("duration_"):
+        days = int(query.data.split("_")[1])
+        new_key, expiry = create_license(days_valid=days)
+        await query.message.reply_text(f"Licenza creata ✅\nChiave: {new_key}\nScadenza: {expiry}")
 
-    elif query.data == "publish":
-        await publish_product(context.bot, product)
-        await query.message.reply_text("Prodotto pubblicato nel canale ✅")
+    elif query.data == "renew_license":
+        context.user_data["action"] = "renew"
+        keyboard = [
+            [InlineKeyboardButton("1 mese", callback_data="renew_30")],
+            [InlineKeyboardButton("3 mesi", callback_data="renew_90")],
+            [InlineKeyboardButton("6 mesi", callback_data="renew_180")],
+            [InlineKeyboardButton("12 mesi", callback_data="renew_365")]
+        ]
+        await query.message.reply_text("Seleziona la durata per il rinnovo:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# 🔹 Gestione input manuale (prezzo o titolo)
-async def manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('waiting_price'):
-        price = update.message.text.strip()
-        context.user_data['product']['price'] = price
-        await update.message.reply_text(
-            f"Prezzo aggiornato a: {price}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]])
-        )
-        context.user_data['waiting_price'] = False
+    elif query.data.startswith("renew_"):
+        days = int(query.data.split("_")[1])
+        action_key = context.user_data.get("selected_license")
+        if not action_key:
+            await query.message.reply_text("Errore: prima seleziona la chiave da rinnovare tramite messaggio testuale.")
+            return
+        LICENSES[action_key]["scadenza"] = (datetime.datetime.now() + datetime.timedelta(days=days)).isoformat()
+        LICENSES[action_key]["usata"] = False
+        save_licenses()
+        context.user_data["selected_license"] = None
+        await query.message.reply_text(f"Chiave {action_key} rinnovata ✅")
 
-    elif context.user_data.get('waiting_title'):
-        title = update.message.text.strip()
-        context.user_data['product']['title'] = title
-        await update.message.reply_text(
-            f"Titolo aggiornato a: {title}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]])
-        )
-        context.user_data['waiting_title'] = False
+    elif query.data == "delete_license":
+        context.user_data["action"] = "delete"
+        await query.message.reply_text("Inserisci la chiave da eliminare:")
 
-# 🔹 Pubblicazione programmata
-async def schedule_publish(bot, product, minutes):
-    await asyncio.sleep(minutes * 60)
-    await publish_product(bot, product)
+    elif query.data == "expired_license":
+        expired = []
+        now = datetime.datetime.now()
+        for k, v in LICENSES.items():
+            if not v.get("admin", False) and datetime.datetime.fromisoformat(v["scadenza"]) < now:
+                expired.append(k)
+        if expired:
+            await query.message.reply_text("Licenze scadute:\n" + "\n".join(expired))
+        else:
+            await query.message.reply_text("Nessuna licenza scaduta ✅")
 
-# 🔹 Funzione pubblicazione
-async def publish_product(bot, product):
-    msg = f"📌 <b>{product['title']}</b>\n〰️〰️〰️〰️\n💶 {product['price']}\n〰️〰️〰️〰️\n📲 <a href='{product['url']}'>Acquista su Amazon</a>"
-    if product['img']:
-        await bot.send_photo(chat_id=GROUP_ID, photo=product['img'], caption=msg, parse_mode="HTML")
-    else:
-        await bot.send_message(chat_id=GROUP_ID, text=msg, parse_mode="HTML")
+    elif query.data == "all_licenses":
+        lines = []
+        for k, v in LICENSES.items():
+            tipo = "Admin" if v.get("admin", False) else "Utente"
+            usata = "✅" if v.get("usata", False) else "❌"
+            scadenza = v.get("scadenza", "N/A")
+            lines.append(f"{k} | {tipo} | Usata: {usata} | Scade: {scadenza}")
+        if lines:
+            await query.message.reply_text("Tutte le licenze:\n" + "\n".join(lines))
+        else:
+            await query.message.reply_text("Nessuna licenza presente.")
 
-# 🔹 Comando /start per gestione licenza
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Gestione input rinnovo/eliminazione ---
+async def handle_text_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-
-    # Controlla se l'utente ha già licenza attiva
-    if check_user_license(user_id):
-        await update.message.reply_text("✅ Licenza valida! Puoi usare il bot.")
+    key = ACTIVE_USERS.get(str(user_id))
+    if not key or not LICENSES[key].get("admin", False):
         return
 
-    await update.message.reply_text("Benvenuto! Inserisci la tua chiave di licenza per attivare il bot:")
-
-    # Aspetta input licenza
-    context.user_data['waiting_license'] = True
-
-async def handle_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('waiting_license'):
-        await handle_link(update, context)
+    action = context.user_data.get("action")
+    if not action:
         return
 
-    license_key = update.message.text.strip()
-    user_id = update.message.from_user.id
-
-    if license_key not in LICENSES:
-        await update.message.reply_text("❌ Licenza non valida.")
+    input_key = update.message.text.strip().upper()
+    if input_key not in LICENSES:
+        await update.message.reply_text("Chiave non trovata ❌")
+        context.user_data["action"] = None
         return
 
-    data = LICENSES[license_key]
-    scadenza = datetime.datetime.fromisoformat(data["scadenza"])
+    if action == "renew":
+        context.user_data["selected_license"] = input_key
+        await update.message.reply_text(f"Chiave {input_key} selezionata. Ora scegli la durata con i bottoni ⏰")
+    elif action == "delete":
+        del LICENSES[input_key]
+        save_licenses()
+        await update.message.reply_text(f"Chiave {input_key} eliminata ✅")
 
-    if data["usata"]:
-        await update.message.reply_text("❌ Questa licenza è già stata utilizzata.")
-        return
-    if datetime.datetime.now() > scadenza:
-        await update.message.reply_text("❌ Licenza scaduta.")
-        return
+    context.user_data["action"] = None
 
-    # Licenza valida
-    data["usata"] = True
-    ACTIVE_USERS[str(user_id)] = license_key
-    save_json(LICENSES_FILE, LICENSES)
-    save_json(ACTIVE_USERS_FILE, ACTIVE_USERS)
+# --- Setup bot ---
+app = Application.builder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("licenze", manage_licenses))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, license_entry))
+app.add_handler(CallbackQueryHandler(button_callback))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_admin))
 
-    context.user_data['waiting_license'] = False
-    await update.message.reply_text("✅ Licenza attivata! Puoi ora usare tutte le funzionalità del bot.")
-
-# 🔹 Server Flask per keep-alive Render
-flask_app = Flask('')
-
-@flask_app.route('/')
-def home():
-    return "Bot attivo 🚀"
-
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=5000)
-
-Thread(target=run_flask).start()
-
-# 🔹 Avvio bot
-def main():
-    telegram_app = Application.builder().token(TOKEN).build()
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_license))
-    telegram_app.add_handler(CallbackQueryHandler(button_callback))
-    telegram_app.run_polling()
-
+# --- Avvio bot ---
 if __name__ == "__main__":
-    main()
+    app.run_polling()
