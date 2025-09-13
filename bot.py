@@ -72,7 +72,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "title": title,
         "img": img_url,
         "url": url,
-        "price": "Prezzo non inserito"
+        "price": "<b><u>Prezzo non inserito</u></b>"
     }
     context.user_data['waiting_price'] = False
     context.user_data['product_ready'] = True
@@ -80,7 +80,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption_text = (
         f"📌 {title}\n\n"
         f"➖➖➖\n\n"
-        f"💶 Prezzo non inserito\n\n"
+        f"💶 {context.user_data['product']['price']}\n\n"
         f"➖➖➖\n\n"
         f"🛒 Acquista su Amazon"
     )
@@ -91,9 +91,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if img_url:
-        await original_msg.reply_photo(photo=img_url, caption=caption_text, reply_markup=reply_markup)
+        await original_msg.reply_photo(photo=img_url, caption=caption_text, reply_markup=reply_markup, parse_mode="HTML")
     else:
-        await original_msg.reply_text(caption_text, reply_markup=reply_markup)
+        await original_msg.reply_text(caption_text, reply_markup=reply_markup, parse_mode="HTML")
 
     logging.info(f"Prodotto caricato: {title}")
 
@@ -138,7 +138,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not price.endswith("€"):
             price = f"{price}€"
 
-        context.user_data['product']['price'] = price
+        # 🔥 Formattiamo sempre grassetto + sottolineato
+        context.user_data['product']['price'] = f"<b><u>{price}</u></b>"
         context.user_data['waiting_price'] = False
 
         product = context.user_data['product']
