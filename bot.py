@@ -2,7 +2,7 @@ import logging
 import requests
 import os
 from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from flask import Flask
 from threading import Thread
@@ -60,7 +60,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     original_msg = update.message
     url = original_msg.text.strip()
 
-    loading_msg = await original_msg.reply_text("📦 Caricamento prodotto...")
+    await original_msg.reply_text("📦 Caricamento prodotto...")
 
     # Espande link e aggiunge tag affiliato
     url = expand_url(url)
@@ -77,9 +77,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['waiting_price'] = False
     context.user_data['product_ready'] = True
 
-    caption_text = f"📌 {title}\n〰️〰️〰️〰️\n💶 Prezzo non inserito\n〰️〰️〰️〰️\n📲 Acquista su Amazon"
+    caption_text = (
+        f"📌 {title}\n\n"
+        f"➖➖➖\n\n"
+        f"💶 Prezzo non inserito\n\n"
+        f"➖➖➖\n\n"
+        f"🛒 Acquista su Amazon"
+    )
     keyboard = [
-        [InlineKeyboardButton("💰 Modifica Prezzo", callback_data="modify")],
+        [InlineKeyboardButton("✏️ Modifica prezzo", callback_data="modify")],
         [InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -108,11 +114,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "publish":
         caption_text = (
-            f"📌 <b>{product['title']}</b>\n"
-            f"〰️〰️〰️〰️\n"
-            f"💶 <b><u>{product['price']}</u></b>\n"
-            f"〰️〰️〰️〰️\n"
-            f"📲 <a href='{product['url']}'>Acquista su Amazon</a>"
+            f"📌 {product['title']}\n\n"
+            f"➖➖➖\n\n"
+            f"💶 {product['price']}\n\n"
+            f"➖➖➖\n\n"
+            f"🛒 <a href='{product['url']}'>Acquista su Amazon</a>"
         )
         if product.get('img'):
             await context.bot.send_photo(chat_id=GROUP_ID, photo=product['img'], caption=caption_text, parse_mode="HTML")
@@ -137,14 +143,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         product = context.user_data['product']
         caption_text = (
-            f"📌 <b>{product['title']}</b>\n"
-            f"〰️〰️〰️〰️\n"
-            f"💶 <b><u>{product['price']}</u></b>\n"
-            f"〰️〰️〰️〰️\n"
-            f"📲 <a href='{product['url']}'>Acquista su Amazon</a>"
+            f"📌 {product['title']}\n\n"
+            f"➖➖➖\n\n"
+            f"💶 {product['price']}\n\n"
+            f"➖➖➖\n\n"
+            f"🛒 <a href='{product['url']}'>Acquista su Amazon</a>"
         )
         keyboard = [
-            [InlineKeyboardButton("💰 Modifica Prezzo", callback_data="modify")],
+            [InlineKeyboardButton("✏️ Modifica prezzo", callback_data="modify")],
             [InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -188,4 +194,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
