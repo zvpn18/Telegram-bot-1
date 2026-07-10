@@ -1,197 +1,210 @@
-import logging
-import requests
 import os
-from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from flask import Flask
-from threading import Thread
 
-# CONFIGURAZIONE BOT
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7817602011:AAHAuov03EDtJe9kQ-kzu5RPQuScOJW_G-U")
-GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1003074106173"))
-AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "prodottipe0c9-21")
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 
-logging.basicConfig(level=logging.INFO)
 
-# 🔹 Espande short link
-def expand_url(url):
-    try:
-        session = requests.Session()
-        resp = session.head(url, allow_redirects=True, timeout=10)
-        logging.info(f"URL espanso: {resp.url}")
-        return resp.url
-    except Exception as e:
-        logging.error(f"Errore espansione URL: {e}")
-        return url
+# Token preso dalle variabili ambiente di TeleBotHost
+TOKEN = os.environ.get("BOT_TOKEN")
 
-# 🔹 Genera link con ASIN + tag affiliato
-def add_affiliate_tag(url, tag):
-    asin = None
-    parts = url.split("/")
-    if "dp" in parts:
-        idx = parts.index("dp")
-        if idx + 1 < len(parts):
-            asin = parts[idx + 1].split("?")[0]
-    if not asin:
-        return url
-    return f"https://www.amazon.it/dp/{asin}?tag={tag}"
+# Account Telegram che riceverà le richieste utenti
+ADMIN_USERNAME = "@peppe_mazzini"
 
-# 🔹 Estrazione info prodotto Amazon
-def parse_amazon(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        page = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(page.content, "html.parser")
-    except Exception as e:
-        logging.error(f"Errore parsing Amazon: {e}")
-        return "Prodotto Amazon", None
 
-    title_tag = soup.find("span", {"id": "productTitle"})
-    title = title_tag.get_text(strip=True) if title_tag else "Prodotto Amazon"
+# MENU PRINCIPALE
+main_menu = [
+    ["📺 Problemi visione"],
+    ["📱 Problemi applicazione"],
+    ["📲 Richiesta aggiunta eventi, film o serie tv"]
+]
 
-    img_tag = soup.find("img", {"id": "landingImage"})
-    img_url = img_tag.get("src") if img_tag and hasattr(img_tag, 'get') else None
 
-    return title, img_url
+# SOTTOMENU
+visione_menu = [
+    ["📺 I canali si bloccano"],
+    ["⚫️ Schermo nero"],
+    ["⬅️ Indietro"]
+]
 
-# 🔹 Gestione link Amazon
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    original_msg = update.message
-    url = original_msg.text.strip()
 
-    await original_msg.reply_text("📦 Caricamento prodotto...")
+app_menu = [
+    ["🔑 Problemi di accesso all’app"],
+    ["⬅️ Indietro"]
+]
 
-    # Espande link e aggiunge tag affiliato
-    url = expand_url(url)
-    url = add_affiliate_tag(url, AFFILIATE_TAG)
-    title, img_url = parse_amazon(url)
 
-    # Salva info prodotto
-    context.user_data['product'] = {
-        "title": title,
-        "img": img_url,
-        "url": url,
-        "price": "<b><u>Prezzo non inserito</u></b>"
-    }
-    context.user_data['waiting_price'] = False
-    context.user_data['product_ready'] = True
-
-    caption_text = (
-        f"📌 {title}\n\n"
-        f"➖➖➖\n\n"
-        f"💶 {context.user_data['product']['price']}\n\n"
-        f"➖➖➖\n\n"
-        f"🛒 Acquista su Amazon"
-    )
-    keyboard = [
-        [InlineKeyboardButton("✏️ Modifica prezzo", callback_data="modify")],
-        [InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if img_url:
-        await original_msg.reply_photo(photo=img_url, caption=caption_text, reply_markup=reply_markup, parse_mode="HTML")
-    else:
-        await original_msg.reply_text(caption_text, reply_markup=reply_markup, parse_mode="HTML")
-
-    logging.info(f"Prodotto caricato: {title}")
-
-# 🔹 Callback bottoni
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if not context.user_data.get('product_ready', False):
-        await query.message.reply_text("⏳ Attendi, sto ancora caricando i dati del prodotto...")
-        return
-
-    product = context.user_data.get('product')
-
-    if query.data == "modify":
-        await query.message.reply_text("Scrivi il prezzo (es. 10,99) ⬇️")
-        context.user_data['waiting_price'] = True
-
-    elif query.data == "publish":
-        caption_text = (
-            f"📌 {product['title']}\n\n"
-            f"➖➖➖\n\n"
-            f"💶 {product['price']}\n\n"
-            f"➖➖➖\n\n"
-            f"🛒 <a href='{product['url']}'>Acquista su Amazon</a>"
-        )
-        if product.get('img'):
-            await context.bot.send_photo(chat_id=GROUP_ID, photo=product['img'], caption=caption_text, parse_mode="HTML")
-        else:
-            await context.bot.send_message(chat_id=GROUP_ID, text=caption_text, parse_mode="HTML")
-
-        await query.message.reply_text("Prodotto pubblicato nel canale ✅")
-        logging.info(f"Prodotto pubblicato: {product['title']} - {product['price']}")
-
-# 🔹 Gestione messaggi testo (link o prezzo)
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    # Se l'utente sta inserendo il prezzo
-    if context.user_data.get('waiting_price') and 'product' in context.user_data:
-        price = text.replace(",", ".")
-        if not price.endswith("€"):
-            price = f"{price}€"
-
-        # 🔥 Formattiamo sempre grassetto + sottolineato
-        context.user_data['product']['price'] = f"<b><u>{price}</u></b>"
-        context.user_data['waiting_price'] = False
-
-        product = context.user_data['product']
-        caption_text = (
-            f"📌 {product['title']}\n\n"
-            f"➖➖➖\n\n"
-            f"💶 {product['price']}\n\n"
-            f"➖➖➖\n\n"
-            f"🛒 <a href='{product['url']}'>Acquista su Amazon</a>"
-        )
-        keyboard = [
-            [InlineKeyboardButton("✏️ Modifica prezzo", callback_data="modify")],
-            [InlineKeyboardButton("✅ Pubblica sul canale", callback_data="publish")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        if product.get('img'):
-            await update.message.reply_photo(photo=product['img'], caption=caption_text, parse_mode="HTML", reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(text=caption_text, parse_mode="HTML", reply_markup=reply_markup)
-
-        logging.info(f"Prezzo aggiornato: {product['title']} - {product['price']}")
-        return
-
-    # Altrimenti interpreta come link Amazon
-    if "amazon" in text or "amzn.to" in text or "amzn.eu" in text:
-        await handle_link(update, context)
-    else:
-        await update.message.reply_text("Per favore manda un link Amazon valido 🔗")
-
-# 🔹 Comando /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ciao! Inviami un link Amazon e potrai modificare il prezzo 🚀")
-    logging.info("Bot attivo 🚀")
 
-# 🔹 Server Flask keep-alive
-flask_app = Flask('')
-@flask_app.route('/')
-def home():
-    return "Bot attivo 🚀"
-Thread(target=lambda: flask_app.run(host="0.0.0.0", port=5000)).start()
+    context.user_data["menu"] = "main"
 
-# 🔹 Avvio bot
+    await update.message.reply_text(
+        "Benvenuto.\nSeleziona il problema:",
+        reply_markup=ReplyKeyboardMarkup(
+            main_menu,
+            resize_keyboard=True
+        )
+    )
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    testo = update.message.text
+
+
+    # Se l'utente sta inviando una richiesta contenuto
+    if context.user_data.get("richiesta"):
+
+        user = update.message.from_user
+
+        await context.bot.send_message(
+            chat_id=ADMIN_USERNAME,
+            text=(
+                "📥 NUOVA RICHIESTA CONTENUTO\n\n"
+                f"👤 Utente: {user.first_name}\n"
+                f"🆔 ID: {user.id}\n\n"
+                f"Richiesta:\n{testo}"
+            )
+        )
+
+        await update.message.reply_text(
+            "✅ Richiesta inviata allo staff.\n\nGrazie per la collaborazione.",
+            reply_markup=ReplyKeyboardMarkup(
+                [["⬅️ Indietro"]],
+                resize_keyboard=True
+            )
+        )
+
+        context.user_data["richiesta"] = False
+        return
+
+
+    # MENU PRINCIPALE
+
+    if testo == "📺 Problemi visione":
+
+        await update.message.reply_text(
+            "Seleziona il problema:",
+            reply_markup=ReplyKeyboardMarkup(
+                visione_menu,
+                resize_keyboard=True
+            )
+        )
+
+
+    elif testo == "📱 Problemi applicazione":
+
+        await update.message.reply_text(
+            "Seleziona il problema:",
+            reply_markup=ReplyKeyboardMarkup(
+                app_menu,
+                resize_keyboard=True
+            )
+        )
+
+
+    elif testo == "📲 Richiesta aggiunta eventi, film o serie tv":
+
+        context.user_data["richiesta"] = True
+
+        await update.message.reply_text(
+            "Invia ora il titolo dell’evento, del film o della serie tv che vuoi far inserire in lista.\n\n"
+            "Puoi inviare anche la foto della locandina.\n\n"
+            "Lo staff lavorerà la tua richiesta e aggiungerà il contenuto alla lista."
+        )
+
+
+    # PROBLEMI VISIONE
+
+    elif testo == "📺 I canali si bloccano":
+
+        await update.message.reply_text(
+            "Esci dall’app, tieni spento il router per 5 minuti e riprova.\n\n"
+            "In alternativa puoi provare ad utilizzare internet del cellulare collegandolo alla TV.",
+            reply_markup=ReplyKeyboardMarkup(
+                [["⬅️ Indietro"]],
+                resize_keyboard=True
+            )
+        )
+
+
+    elif testo == "⚫️ Schermo nero":
+
+        await update.message.reply_text(
+            "Controlla la connessione Internet.\n\n"
+            "Dopodiché vai sulla schermata principale dell’app e aggiorna la lista canali premendo UPDATE in alto a destra.",
+            reply_markup=ReplyKeyboardMarkup(
+                [["⬅️ Indietro"]],
+                resize_keyboard=True
+            )
+        )
+
+
+    # PROBLEMI APPLICAZIONE
+
+    elif testo == "🔑 Problemi di accesso all’app":
+
+        await update.message.reply_text(
+            "Controlla lo stato della linea Internet.\n\n"
+            "Se il problema persiste, prova ad utilizzare Internet del cellulare collegandolo alla TV.\n\n"
+            "Se il problema non si risolve procedi in questo modo:\n\n"
+            "1) Esci dall’app e vai nelle impostazioni della chiavetta.\n"
+            "2) Premi su Applicazioni e poi Gestisci app installate.\n"
+            "3) Premi su OK-Tv.\n"
+            "4) Premi su Cancella cache e riprova.\n\n"
+            "Se il problema persiste premi anche Cancella dati.\n"
+            "Apri l’app, inserisci le tue credenziali e riprova.",
+            reply_markup=ReplyKeyboardMarkup(
+                [["⬅️ Indietro"]],
+                resize_keyboard=True
+            )
+        )
+
+
+    # INDIETRO
+
+    elif testo == "⬅️ Indietro":
+
+        await update.message.reply_text(
+            "Menu principale:",
+            reply_markup=ReplyKeyboardMarkup(
+                main_menu,
+                resize_keyboard=True
+            )
+        )
+
+
 def main():
-    telegram_app = Application.builder().token(TOKEN).build()
 
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CallbackQueryHandler(button_callback))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    if not TOKEN:
+        raise ValueError(
+            "Token BOT_TOKEN non trovato nelle variabili ambiente"
+        )
 
-    logging.info("Bot avviato e in ascolto dei messaggi 🚀")
-    telegram_app.run_polling()
+
+    application = Application.builder().token(TOKEN).build()
+
+
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            message_handler
+        )
+    )
+
+
+    application.run_polling()
+
 
 if __name__ == "__main__":
     main()
