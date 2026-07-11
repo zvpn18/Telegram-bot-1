@@ -11,7 +11,7 @@ from telegram.ext import (
 
 
 # Token preso dalle variabili ambiente di TeleBotHost
-TOKEN = "8359722910:AAG8Ud2SyOmNn329NwlyH8oV1r2z5EvqVjY"
+TOKEN = os.environ.get("BOT_TOKEN")
 
 # Account Telegram che riceverà le richieste utenti
 ADMIN_USERNAME = "@peppe_mazzini"
