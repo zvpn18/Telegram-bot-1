@@ -1,155 +1,140 @@
+import telebot
 import os
+from telebot import types
 
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
+TOKEN = os.environ.get("TOKEN")
+ADMIN_ID = os.environ.get("ADMIN_ID")
 
+bot = telebot.TeleBot(TOKEN)
 
-# Token preso dalle variabili ambiente di TeleBotHost
-TOKEN = os.environ.get("BOT_TOKEN")
-
-# Account Telegram che riceverà le richieste utenti
-ADMIN_USERNAME = "@peppe_mazzini"
-
+# Stati utente
+user_state = {}
 
 # MENU PRINCIPALE
-main_menu = [
-    ["📺 Problemi visione"],
-    ["📱 Problemi applicazione"],
-    ["📲 Richiesta aggiunta eventi, film o serie tv"]
-]
-
+main_menu = types.ReplyKeyboardMarkup(resize_keyboard=True)
+main_menu.add("📺 Problemi visione")
+main_menu.add("📱 Problemi applicazione") 
+main_menu.add("📲 Richiesta aggiunta eventi, film o serie tv")
 
 # SOTTOMENU
-visione_menu = [
-    ["📺 I canali si bloccano"],
-    ["⚫️ Schermo nero"],
-    ["⬅️ Indietro"]
-]
+visione_menu = types.ReplyKeyboardMarkup(resize_keyboard=True)
+visione_menu.add("📺 I canali si bloccano")
+visione_menu.add("⚫️ Schermo nero")
+visione_menu.add("⬅️ Indietro")
 
+app_menu = types.ReplyKeyboardMarkup(resize_keyboard=True)
+app_menu.add("🔑 Problemi di accesso all’app")
+app_menu.add("⬅️ Indietro")
 
-app_menu = [
-    ["🔑 Problemi di accesso all’app"],
-    ["⬅️ Indietro"]
-]
+back_menu = types.ReplyKeyboardMarkup(resize_keyboard=True)
+back_menu.add("⬅️ Indietro")
 
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    context.user_data["menu"] = "main"
-
-    await update.message.reply_text(
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_state[message.chat.id] = "main"
+    bot.send_message(
+        message.chat.id,
         "Benvenuto.\nSeleziona il problema:",
-        reply_markup=ReplyKeyboardMarkup(
-            main_menu,
-            resize_keyboard=True
-        )
+        reply_markup=main_menu
     )
 
+@bot.message_handler(commands=['id'])
+def get_id(message):
+    bot.reply_to(message, f"Il tuo ID è: `{message.from_user.id}`\n\nCopia questo numero e mettilo in ADMIN_ID su TelebotHost", parse_mode="Markdown")
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    chat_id = message.chat.id
+    if user_state.get(chat_id) == "richiesta":
+        user = message.from_user
+        caption = message.caption or "Nessun titolo"
+        try:
+            bot.send_photo(
+                ADMIN_ID,
+                message.photo[-1].file_id,
+                caption=f"📥 NUOVA RICHIESTA CONTENUTO\n\n"
+                        f"👤 Utente: {user.first_name}\n"
+                        f"🆔 ID: {user.id}\n"
+                        f"Username: @{user.username}\n\n"
+                        f"Richiesta:\n{caption}"
+            )
+            bot.send_message(
+                chat_id,
+                "✅ Richiesta con locandina inviata allo staff.\n\nGrazie per la collaborazione.",
+                reply_markup=back_menu
+            )
+        except Exception as e:
+            bot.send_message(
+                chat_id,
+                "❌ Errore invio. Controlla che ADMIN_ID sia impostato correttamente",
+                reply_markup=main_menu
+            )
+        user_state[chat_id] = "main"
 
-    testo = update.message.text
-
-
-    # Se l'utente sta inviando una richiesta contenuto
-    if context.user_data.get("richiesta"):
-
-        user = update.message.from_user
-
-        await context.bot.send_message(
-            chat_id=ADMIN_USERNAME,
-            text=(
-                "📥 NUOVA RICHIESTA CONTENUTO\n\n"
+@bot.message_handler(func=lambda m: True)
+def message_handler(message):
+    chat_id = message.chat.id
+    testo = message.text
+    
+    if user_state.get(chat_id) == "richiesta":
+        user = message.from_user
+        try:
+            bot.send_message(
+                ADMIN_ID,
+                f"📥 NUOVA RICHIESTA CONTENUTO\n\n"
                 f"👤 Utente: {user.first_name}\n"
-                f"🆔 ID: {user.id}\n\n"
+                f"🆔 ID: {user.id}\n"
+                f"Username: @{user.username}\n\n"
                 f"Richiesta:\n{testo}"
             )
-        )
-
-        await update.message.reply_text(
-            "✅ Richiesta inviata allo staff.\n\nGrazie per la collaborazione.",
-            reply_markup=ReplyKeyboardMarkup(
-                [["⬅️ Indietro"]],
-                resize_keyboard=True
+            bot.send_message(
+                chat_id,
+                "✅ Richiesta inviata allo staff.\n\nGrazie per la collaborazione.",
+                reply_markup=back_menu
             )
-        )
-
-        context.user_data["richiesta"] = False
+        except:
+            bot.send_message(
+                chat_id,
+                "❌ Errore invio. L'admin deve prima avviare il bot con /start e ADMIN_ID deve essere impostato",
+                reply_markup=main_menu
+            )
+        user_state[chat_id] = "main"
         return
 
-
-    # MENU PRINCIPALE
-
     if testo == "📺 Problemi visione":
-
-        await update.message.reply_text(
-            "Seleziona il problema:",
-            reply_markup=ReplyKeyboardMarkup(
-                visione_menu,
-                resize_keyboard=True
-            )
-        )
-
-
+        bot.send_message(chat_id, "Seleziona il problema:", reply_markup=visione_menu)
+    
     elif testo == "📱 Problemi applicazione":
-
-        await update.message.reply_text(
-            "Seleziona il problema:",
-            reply_markup=ReplyKeyboardMarkup(
-                app_menu,
-                resize_keyboard=True
-            )
-        )
-
-
+        bot.send_message(chat_id, "Seleziona il problema:", reply_markup=app_menu)
+    
     elif testo == "📲 Richiesta aggiunta eventi, film o serie tv":
-
-        context.user_data["richiesta"] = True
-
-        await update.message.reply_text(
+        user_state[chat_id] = "richiesta"
+        bot.send_message(
+            chat_id,
             "Invia ora il titolo dell’evento, del film o della serie tv che vuoi far inserire in lista.\n\n"
             "Puoi inviare anche la foto della locandina.\n\n"
             "Lo staff lavorerà la tua richiesta e aggiungerà il contenuto alla lista."
         )
 
-
-    # PROBLEMI VISIONE
-
     elif testo == "📺 I canali si bloccano":
-
-        await update.message.reply_text(
+        bot.send_message(
+            chat_id,
             "Esci dall’app, tieni spento il router per 5 minuti e riprova.\n\n"
             "In alternativa puoi provare ad utilizzare internet del cellulare collegandolo alla TV.",
-            reply_markup=ReplyKeyboardMarkup(
-                [["⬅️ Indietro"]],
-                resize_keyboard=True
-            )
+            reply_markup=back_menu
         )
-
-
+    
     elif testo == "⚫️ Schermo nero":
-
-        await update.message.reply_text(
+        bot.send_message(
+            chat_id,
             "Controlla la connessione Internet.\n\n"
             "Dopodiché vai sulla schermata principale dell’app e aggiorna la lista canali premendo UPDATE in alto a destra.",
-            reply_markup=ReplyKeyboardMarkup(
-                [["⬅️ Indietro"]],
-                resize_keyboard=True
-            )
+            reply_markup=back_menu
         )
 
-
-    # PROBLEMI APPLICAZIONE
-
     elif testo == "🔑 Problemi di accesso all’app":
-
-        await update.message.reply_text(
+        bot.send_message(
+            chat_id,
             "Controlla lo stato della linea Internet.\n\n"
             "Se il problema persiste, prova ad utilizzare Internet del cellulare collegandolo alla TV.\n\n"
             "Se il problema non si risolve procedi in questo modo:\n\n"
@@ -159,52 +144,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "4) Premi su Cancella cache e riprova.\n\n"
             "Se il problema persiste premi anche Cancella dati.\n"
             "Apri l’app, inserisci le tue credenziali e riprova.",
-            reply_markup=ReplyKeyboardMarkup(
-                [["⬅️ Indietro"]],
-                resize_keyboard=True
-            )
+            reply_markup=back_menu
         )
-
-
-    # INDIETRO
 
     elif testo == "⬅️ Indietro":
+        user_state[chat_id] = "main"
+        bot.send_message(chat_id, "Menu principale:", reply_markup=main_menu)
 
-        await update.message.reply_text(
-            "Menu principale:",
-            reply_markup=ReplyKeyboardMarkup(
-                main_menu,
-                resize_keyboard=True
-            )
-        )
-
-
-def main():
-
-    if not TOKEN:
-        raise ValueError(
-            "Token BOT_TOKEN non trovato nelle variabili ambiente"
-        )
-
-
-    application = Application.builder().token(TOKEN).build()
-
-
-    application.add_handler(
-        CommandHandler("start", start)
-    )
-
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            message_handler
-        )
-    )
-
-
-    application.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+print("Bot avviato...")
+bot.infinity_polling(timeout=60)
